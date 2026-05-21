@@ -36,3 +36,6 @@ youtube-transcript-api==0.6.2
 pytesseract==0.3.10  # OCR for scanned PDFs
 pdf2image==1.17.0    # Convert PDF pages to images for OCR
 Pillow==10.3.0       # Required by pdf2image
+openpyxl==3.1.2      # For .xlsx Excel parsing
+xlrd==2.0.1          # For legacy .xls Excel parsing
+psycopg2-binary

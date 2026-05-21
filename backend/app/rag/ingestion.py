@@ -31,11 +31,17 @@ print("[Ingestion] Loading embedding model... (one-time startup cost)")
 embed_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
 print("[Ingestion] Embedding model loaded.")
 
-qdrant_client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
+qdrant_client = QdrantClient(
+    host=settings.QDRANT_HOST,
+    port=settings.QDRANT_PORT,
+    timeout=120,        # 2-minute timeout for large upserts
+    prefer_grpc=False,  # use HTTP to avoid WinError 10053 gRPC socket issues
+)
 
 VECTOR_COLLECTION = "sourcemind_documents"
 AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "ogg", "flac", "webm", "aac"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "tiff", "tif", "bmp", "gif", "webp"}
+EXCEL_EXTENSIONS = {"xlsx", "xls", "xlsm", "xlsb"}
 
 # ── Chunk cap: never embed more than this many chunks per document ─────────────
 # Large files beyond this are sampled evenly so ingestion stays under ~2 minutes
@@ -148,6 +154,70 @@ def extract_text_from_image(file_bytes: bytes) -> str:
         raise ValueError(f"Image OCR failed: {e}")
 
 
+def extract_text_from_excel(file_bytes: bytes, file_ext: str) -> str:
+    """
+    Extract text from Excel files (.xlsx, .xls, .xlsm, .xlsb).
+    Each sheet is rendered as a readable table with column headers and row values.
+    """
+    import openpyxl
+
+    workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    text_parts = []
+
+    for sheet_name in workbook.sheetnames:
+        sheet = workbook[sheet_name]
+        text_parts.append(f"=== Sheet: {sheet_name} ===")
+
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows:
+            text_parts.append("(empty sheet)")
+            continue
+
+        # Use first row as headers if it contains any non-None values
+        headers = [str(c) if c is not None else "" for c in rows[0]]
+        has_headers = any(h.strip() for h in headers)
+
+        if has_headers:
+            text_parts.append(" | ".join(headers))
+            text_parts.append("-" * 60)
+            data_rows = rows[1:]
+        else:
+            data_rows = rows
+
+        for row in data_rows:
+            # Skip completely empty rows
+            if all(cell is None or str(cell).strip() == "" for cell in row):
+                continue
+            row_text = " | ".join(str(c) if c is not None else "" for c in row)
+            text_parts.append(row_text)
+
+        text_parts.append("")  # blank line between sheets
+
+    workbook.close()
+    return "\n".join(text_parts)
+
+
+def extract_text_from_csv(file_bytes: bytes) -> str:
+    """Extract text from CSV files."""
+    import csv
+
+    text_parts = []
+    # Try UTF-8 first, fall back to latin-1
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            content = file_bytes.decode(encoding)
+            reader = csv.reader(content.splitlines())
+            rows = list(reader)
+            if not rows:
+                return ""
+            for row in rows:
+                text_parts.append(" | ".join(row))
+            return "\n".join(text_parts)
+        except (UnicodeDecodeError, csv.Error):
+            continue
+    return file_bytes.decode("utf-8", errors="ignore")
+
+
 def extract_text_from_docx(file_bytes: bytes) -> str:
     doc = docx.Document(io.BytesIO(file_bytes))
     full_text = []
@@ -254,6 +324,10 @@ def process_document(document_id: str, file_path: str, file_type: str, notebook_
                 text = extract_text_from_audio(file_bytes, file_type_lower)
             elif file_type_lower in IMAGE_EXTENSIONS:
                 text = extract_text_from_image(file_bytes)
+            elif file_type_lower in EXCEL_EXTENSIONS:
+                text = extract_text_from_excel(file_bytes, file_type_lower)
+            elif file_type_lower == "csv":
+                text = extract_text_from_csv(file_bytes)
             else:
                 text = file_bytes.decode("utf-8", errors="ignore")
 
@@ -319,10 +393,29 @@ def process_document(document_id: str, file_path: str, file_type: str, notebook_
         ]
 
         init_qdrant()
-        # Upsert in batches of 500 to avoid memory spikes on large files
-        UPSERT_BATCH = 500
+        # Reconnect to Qdrant fresh before upsert — the module-level connection
+        # can time out after long embedding runs (the WinError 10053 / timed out issue)
+        fresh_qdrant = QdrantClient(
+            host=settings.QDRANT_HOST,
+            port=settings.QDRANT_PORT,
+            timeout=120,
+            prefer_grpc=False,
+        )
+        # Upsert in batches of 200 with retry on connection errors
+        UPSERT_BATCH = 200
         for i in range(0, len(points), UPSERT_BATCH):
-            qdrant_client.upsert(collection_name=VECTOR_COLLECTION, points=points[i:i+UPSERT_BATCH])
+            batch = points[i:i+UPSERT_BATCH]
+            for attempt in range(3):  # retry up to 3 times
+                try:
+                    fresh_qdrant.upsert(collection_name=VECTOR_COLLECTION, points=batch)
+                    break
+                except Exception as upsert_err:
+                    if attempt == 2:
+                        raise  # re-raise on 3rd failure
+                    import time
+                    print(f"[Ingestion] Upsert attempt {attempt+1} failed ({upsert_err}), retrying in 3s...")
+                    time.sleep(3)
+            print(f"[Ingestion] Upserted {min(i+UPSERT_BATCH, len(points))}/{len(points)} vectors")
 
         print(f"[Ingestion] Stored {len(points):,} vectors for document_id={document_id}")
 

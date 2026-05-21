@@ -128,12 +128,25 @@ async def chat_with_notebook(
 
     chunks_res = []
     try:
-        chunks_res, _ = qdrant_client.scroll(
-            collection_name=VECTOR_COLLECTION,
-            scroll_filter=doc_filter,
-            limit=10000,
-            with_payload=True
-        )
+        # Cap at 3000 chunks per scroll to prevent OOM / oversized response.
+        # For notebooks with more chunks, BM25 runs on the first 3000 only;
+        # dense semantic search (below) still covers the full collection via HNSW index.
+        all_chunks = []
+        next_offset = None
+        SCROLL_BATCH = 500
+        SCROLL_MAX = 3000
+        while len(all_chunks) < SCROLL_MAX:
+            batch, next_offset = qdrant_client.scroll(
+                collection_name=VECTOR_COLLECTION,
+                scroll_filter=doc_filter,
+                limit=SCROLL_BATCH,
+                offset=next_offset,
+                with_payload=True
+            )
+            all_chunks.extend(batch)
+            if next_offset is None or len(batch) < SCROLL_BATCH:
+                break
+        chunks_res = all_chunks
     except Exception as scroll_err:
         print(f"Qdrant scroll error (payloads search fallback): {scroll_err}")
 
