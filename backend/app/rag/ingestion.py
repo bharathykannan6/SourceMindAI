@@ -37,6 +37,11 @@ VECTOR_COLLECTION = "sourcemind_documents"
 AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "ogg", "flac", "webm", "aac"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "tiff", "tif", "bmp", "gif", "webp"}
 
+# ── Chunk cap: never embed more than this many chunks per document ─────────────
+# Large files beyond this are sampled evenly so ingestion stays under ~2 minutes
+MAX_CHUNKS_PER_DOC = 2000
+EMBED_BATCH_SIZE = 128  # larger batches = faster on CPU too
+
 
 def get_sync_db_conn():
     """Get a synchronous psycopg2 connection for use inside background threads."""
@@ -212,7 +217,11 @@ def process_document(document_id: str, file_path: str, file_type: str, notebook_
     Parse → chunk → embed → store in Qdrant.
     Updates document status to done or error directly via sync psycopg2.
     """
+    import numpy as np
     print(f"[Ingestion] Starting: document_id={document_id} file_type={file_type}")
+
+    # Mark processing immediately so UI shows PROCESSING not PENDING
+    update_document_status_sync(document_id, "processing")
 
     try:
         file_type_lower = file_type.lower()
@@ -251,30 +260,48 @@ def process_document(document_id: str, file_path: str, file_type: str, notebook_
         if not text.strip():
             raise ValueError("Extracted text is empty")
 
-        print(f"[Ingestion] Extracted {len(text)} chars from document_id={document_id}")
+        print(f"[Ingestion] Extracted {len(text):,} chars from document_id={document_id}")
 
         # ── 2. Chunk ──────────────────────────────────────────────────────────
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
+            chunk_size=1500,
+            chunk_overlap=300,
             length_function=len,
+            separators=["\n\n\n", "\n\n", "\n", ". ", " ", ""]  # prefer semantic splits
         )
         chunks = text_splitter.split_text(text)
 
         if not chunks:
             raise ValueError("No chunks generated from text")
 
-        print(f"[Ingestion] Created {len(chunks)} chunks for document_id={document_id}")
+        total_chunks = len(chunks)
+        print(f"[Ingestion] Created {total_chunks:,} chunks for document_id={document_id}")
 
-        # ── 3. Embed (model already loaded at startup — fast) ─────────────────
-        embeddings = embed_model.encode(
-            chunks,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-            batch_size=32
-        )
+        # Cap chunks for very large files — evenly sample across the whole doc
+        if total_chunks > MAX_CHUNKS_PER_DOC:
+            step = total_chunks / MAX_CHUNKS_PER_DOC
+            indices = [int(i * step) for i in range(MAX_CHUNKS_PER_DOC)]
+            chunks = [chunks[i] for i in indices]
+            print(f"[Ingestion] Large file: sampled {MAX_CHUNKS_PER_DOC:,} from {total_chunks:,} chunks (every {step:.1f}th)")
 
-        print(f"[Ingestion] Embeddings done for document_id={document_id}")
+        # ── 3. Embed in batches with progress logging ───────────────────────────
+        all_embeddings = []
+        n_chunks = len(chunks)
+        for batch_start in range(0, n_chunks, EMBED_BATCH_SIZE):
+            batch = chunks[batch_start:batch_start + EMBED_BATCH_SIZE]
+            batch_emb = embed_model.encode(
+                batch,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+                batch_size=EMBED_BATCH_SIZE
+            )
+            all_embeddings.append(batch_emb)
+            done = min(batch_start + EMBED_BATCH_SIZE, n_chunks)
+            pct = 100 * done // n_chunks
+            print(f"[Ingestion] Embedded {done}/{n_chunks} chunks ({pct}%) document_id={document_id}")
+
+        embeddings = np.vstack(all_embeddings)
+        print(f"[Ingestion] All embeddings done for document_id={document_id}")
 
         # ── 4. Store in Qdrant ────────────────────────────────────────────────
         points = [
@@ -292,9 +319,12 @@ def process_document(document_id: str, file_path: str, file_type: str, notebook_
         ]
 
         init_qdrant()
-        qdrant_client.upsert(collection_name=VECTOR_COLLECTION, points=points)
+        # Upsert in batches of 500 to avoid memory spikes on large files
+        UPSERT_BATCH = 500
+        for i in range(0, len(points), UPSERT_BATCH):
+            qdrant_client.upsert(collection_name=VECTOR_COLLECTION, points=points[i:i+UPSERT_BATCH])
 
-        print(f"[Ingestion] Stored {len(points)} vectors for document_id={document_id}")
+        print(f"[Ingestion] Stored {len(points):,} vectors for document_id={document_id}")
 
         # ── 5. Mark as done ───────────────────────────────────────────────────
         update_document_status_sync(document_id, "done")
@@ -302,4 +332,4 @@ def process_document(document_id: str, file_path: str, file_type: str, notebook_
 
     except Exception as e:
         print(f"[Ingestion] ERROR: document_id={document_id} error={e}")
-        update_document_status_sync(document_id, "error")
+        update_document_status_sync(document_id, "error", error_message=str(e))

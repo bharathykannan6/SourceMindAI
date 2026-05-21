@@ -185,14 +185,27 @@ async def chat_with_notebook(
                     
         sorted_bm25 = sorted(bm25_scores.items(), key=lambda x: x[1], reverse=True)
 
-    # 4. Retrieve dense semantic search results (top 15) from Qdrant
+    # Detect query type to adjust retrieval depth
+    query_lower = request.message.lower()
+    is_toc_query = any(term in query_lower for term in ["table of content", "table of contents", "toc", "index of", "chapters", "list the contents"])
+    is_broad_query = any(term in query_lower for term in [
+        "summarize", "summary", "overview", "explain", "describe", "tell me about",
+        "what is", "what are", "journey", "history", "all", "entire", "whole",
+        "everything", "comprehensive", "detailed", "full"
+    ])
+
+    # Scale retrieval depth to query type
+    dense_limit = 30 if (is_broad_query or is_toc_query) else 15
+    max_context_chunks = 40 if is_toc_query else (30 if is_broad_query else 15)
+
+    # 4. Retrieve dense semantic search results from Qdrant
     dense_results = []
     try:
         dense_results = qdrant_client.search(
             collection_name=VECTOR_COLLECTION,
             query_vector=query_vector,
             query_filter=doc_filter,
-            limit=15
+            limit=dense_limit
         )
     except Exception as e:
         print(f"Qdrant dense search error: {e}")
@@ -221,8 +234,6 @@ async def chat_with_notebook(
     context_str = ""
     citations_list: List[Citation] = []
     doc_cache = {}
-
-    is_toc_query = any(term in request.message.lower() for term in ["table of content", "table of contents", "toc", "index of", "chapters", "list the contents"])
 
     final_hits = []
     seen_chunk_keys = set()
@@ -318,8 +329,7 @@ async def chat_with_notebook(
 
         final_hits.append((hit, score))
 
-    # Determine how many context chunks to send to the LLM
-    max_context_chunks = 30 if is_toc_query else 15
+    # Determine how many context chunks to send to the LLM (set dynamically above)
     for idx, (hit, score) in enumerate(final_hits[:max_context_chunks]):
         payload = hit.payload if hit.payload else {}
         doc_id = payload.get("document_id")
@@ -355,16 +365,15 @@ async def chat_with_notebook(
 
     # 5. Synthesize LLM Response
     system_prompt = (
-        "You are a strict document-only AI research assistant inside OpenNotebookLM.\n"
-        f"You are helping the user with their notebook named '{notebook_name}'.\n"
-        "CRITICAL RULES - you MUST follow these without exception:\n"
-        "1. You may ONLY answer using the Source Context chunks provided below. Nothing else.\n"
-        "2. You must NEVER use your pre-trained knowledge, general knowledge, or any information outside the provided Source Context.\n"
-        "3. If the Source Context does not contain information to answer the query, you MUST respond EXACTLY with:\n"
-        "   \"I'm sorry, but the information about '[topic]' is not present in any of the documents uploaded to this notebook. Please upload a document containing this information and try again.\"\n"
-        "4. Do NOT add any general information, background knowledge, or helpful tips from outside the documents. Silence is better than hallucination.\n"
-        "5. Use inline citations like [1], [2], etc., corresponding to the numbered sources provided. Never invent citations.\n"
-        "6. Format your response clearly in Markdown.\n"
+        "You are an expert AI research assistant inside OpenNotebookLM.\n"
+        f"You are helping the user with their notebook named '{notebook_name}'.\n\n"
+        "RULES:\n"
+        "1. Answer ONLY using the Source Context chunks provided. Never use outside knowledge.\n"
+        "2. For summary/overview questions: synthesize ALL relevant chunks into a thorough, well-structured response. Group related information into clear sections with headers. Don't just list facts — explain the significance.\n"
+        "3. For specific questions: answer precisely and cite sources with [1], [2] etc.\n"
+        "4. If the context truly doesn't contain the answer, say: \"The uploaded documents don't contain information about '[topic]'. Please upload a relevant document.\"\n"
+        "5. Format in Markdown with headers, bullet points, and bold text where appropriate.\n"
+        "6. Be thorough — a good summary should cover all major themes from the context, not just the first few chunks.\n"
     )
 
     user_content = f"Source Context:\n{context_str or 'No sources available in this notebook.'}\n\nUser Query: {request.message}"
@@ -379,8 +388,9 @@ async def chat_with_notebook(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content}
                 ],
-                model="llama-3.1-8b-instant",
-                temperature=0.3,
+                model="llama-3.3-70b-versatile",
+                temperature=0.2,
+                max_tokens=2048,
             )
             llm_response = completion.choices[0].message.content
         except Exception as groq_err:

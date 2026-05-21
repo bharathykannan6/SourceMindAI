@@ -7,7 +7,7 @@ import { AnimatedButton } from "@/components/ui/AnimatedButton";
 import { 
   FileText, Search, Folder, Plus, Bot, ArrowUpRight, 
   Paperclip, Mic, Send, Network, Loader2, Sparkles, X, LayoutTemplate, Trash2,
-  CheckSquare, CheckCheck, Filter
+  CheckSquare, CheckCheck, Filter, RotateCcw, Pencil
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
@@ -16,7 +16,9 @@ import {
   fetchDocuments, 
   uploadDocument, 
   fetchNotebooks, 
-  createNotebook, 
+  createNotebook,
+  renameNotebook,
+  deleteNotebook,
   sendChatMessage, 
   ingestText,
   deleteDocument,
@@ -171,6 +173,42 @@ function WorkspaceContent() {
     }
   });
 
+  const [renamingNotebookId, setRenamingNotebookId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+
+  // Delete Notebook Mutation
+  const deleteNotebookMutation = useMutation({
+    mutationFn: (notebookId: string) => deleteNotebook(notebookId),
+    onSuccess: (_, notebookId) => {
+      queryClient.invalidateQueries({ queryKey: ['notebooks'] });
+      // If deleted notebook was selected, clear selection
+      if (selectedNotebookId === notebookId) {
+        setSelectedNotebookId(null);
+        const params = new URLSearchParams(searchParams.toString());
+        params.delete('notebookId');
+        router.replace(`${pathname}?${params.toString()}`);
+      }
+    },
+    onError: (error: any) => {
+      console.error('Failed to delete notebook', error);
+      alert('Failed to delete notebook: ' + (error?.response?.data?.detail || error.message));
+    }
+  });
+
+  // Rename Notebook Mutation
+  const renameNotebookMutation = useMutation({
+    mutationFn: ({ id, name }: { id: string; name: string }) => renameNotebook(id, name),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['notebooks'] });
+      setRenamingNotebookId(null);
+      setRenameValue("");
+    },
+    onError: (error: any) => {
+      console.error('Failed to rename notebook', error);
+      alert('Failed to rename: ' + (error?.response?.data?.detail || error.message));
+    }
+  });
+
   // Create Notebook (Folder) Mutation
   const createNotebookMutation = useMutation({
     mutationFn: (name: string) => createNotebook(name),
@@ -257,6 +295,15 @@ function WorkspaceContent() {
     }
   };
 
+  const handleClearChat = () => {
+    setMessages([
+      {
+        role: "assistant",
+        content: "I've fully ingested your workspace documents. The vectors are mapped and the knowledge graph is ready. How would you like to explore your notes and sources today?",
+      }
+    ]);
+  };
+
   const activeNotebook = notebooks.find(n => n.id === selectedNotebookId);
 
   return (
@@ -295,16 +342,68 @@ function WorkspaceContent() {
               notebooks.map((nb) => (
                 <div
                   key={nb.id}
-                  onClick={() => handleSelectNotebook(nb.id)}
+                  onClick={() => renamingNotebookId !== nb.id && handleSelectNotebook(nb.id)}
                   className={cn(
-                    "flex items-center gap-2 px-2 py-1.5 text-sm cursor-pointer transition-all rounded-lg border",
+                    "flex items-center gap-2 px-2 py-1.5 text-sm cursor-pointer transition-all rounded-lg border group",
                     selectedNotebookId === nb.id 
                       ? "text-primary bg-primary/10 border-primary/20 font-medium" 
                       : "text-muted-foreground hover:text-foreground hover:bg-white/5 border-transparent"
                   )}
                 >
                   <Folder className="w-4 h-4 flex-shrink-0" />
-                  <span className="truncate">{nb.title}</span>
+                  {renamingNotebookId === nb.id ? (
+                    <input
+                      autoFocus
+                      value={renameValue}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && renameValue.trim()) {
+                          renameNotebookMutation.mutate({ id: nb.id, name: renameValue.trim() });
+                        }
+                        if (e.key === 'Escape') {
+                          setRenamingNotebookId(null);
+                          setRenameValue("");
+                        }
+                      }}
+                      onBlur={() => {
+                        if (renameValue.trim() && renameValue.trim() !== nb.title) {
+                          renameNotebookMutation.mutate({ id: nb.id, name: renameValue.trim() });
+                        } else {
+                          setRenamingNotebookId(null);
+                        }
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                      className="flex-1 bg-transparent border-b border-primary/50 outline-none text-foreground text-sm py-0.5 min-w-0"
+                    />
+                  ) : (
+                    <span className="truncate flex-1">{nb.title}</span>
+                  )}
+                  {renamingNotebookId !== nb.id && (
+                    <div className="opacity-0 group-hover:opacity-100 flex items-center gap-0.5 flex-shrink-0">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setRenamingNotebookId(nb.id);
+                          setRenameValue(nb.title);
+                        }}
+                        className="p-1 rounded hover:bg-white/10 text-muted-foreground hover:text-primary transition-colors"
+                        title="Rename notebook"
+                      >
+                        <Pencil className="w-3 h-3" />
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          deleteNotebookMutation.mutate(nb.id);
+                        }}
+                        disabled={deleteNotebookMutation.isPending}
+                        className="p-1 rounded hover:bg-red-500/10 text-muted-foreground hover:text-red-400 transition-colors"
+                        title="Delete notebook"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))
             )}
@@ -499,6 +598,17 @@ function WorkspaceContent() {
             <AnimatedButton 
               variant="outline" 
               size="sm" 
+              className="h-8 bg-surface backdrop-blur-md"
+              onClick={handleClearChat}
+              disabled={messages.length <= 1}
+              title="Clear chat"
+            >
+              <RotateCcw className="w-4 h-4 mr-2" />
+              Clear Chat
+            </AnimatedButton>
+            <AnimatedButton 
+              variant="outline" 
+              size="sm" 
               className={cn("h-8 bg-surface backdrop-blur-md", showGraph && "border-primary text-primary")}
               onClick={() => setShowGraph(!showGraph)}
             >
@@ -643,7 +753,17 @@ function WorkspaceContent() {
             </div>
 
             <div className="glass rounded-[24px] p-2 flex items-end gap-2 border-white/20 shadow-2xl focus-within:border-primary/50 transition-colors bg-surface/80">
-              <button className="p-3 text-muted-foreground hover:text-foreground transition-colors rounded-xl hover:bg-white/5 mb-0.5 cursor-pointer">
+              <button
+                onClick={() => {
+                  if (selectedNotebookId) {
+                    fileInputRef.current?.click();
+                  } else {
+                    alert("Please select a notebook first.");
+                  }
+                }}
+                className="p-3 text-muted-foreground hover:text-foreground transition-colors rounded-xl hover:bg-white/5 mb-0.5 cursor-pointer"
+                title="Upload document"
+              >
                 <Paperclip className="w-5 h-5" />
               </button>
               
