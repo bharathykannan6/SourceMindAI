@@ -1,53 +1,116 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, Suspense } from "react";
+import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { AnimatedButton } from "@/components/ui/AnimatedButton";
 import { 
   FileText, Search, Folder, Plus, Bot, ArrowUpRight, 
-  Paperclip, Mic, Send, Network, Loader2, Sparkles, X, LayoutTemplate
+  Paperclip, Mic, Send, Network, Loader2, Sparkles, X, LayoutTemplate, Trash2,
+  CheckSquare, CheckCheck, Filter
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { fetchDocuments, uploadDocument, Document } from "@/lib/api";
+import { 
+  fetchDocuments, 
+  uploadDocument, 
+  fetchNotebooks, 
+  createNotebook, 
+  sendChatMessage, 
+  ingestText,
+  deleteDocument,
+  Document, 
+  Notebook, 
+  Citation 
+} from "@/lib/api";
 
-export default function WorkspacePage() {
+interface Message {
+  role: "user" | "assistant";
+  content: string;
+  citations?: Citation[];
+}
+
+function WorkspaceContent() {
   const queryClient = useQueryClient();
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+  const notebookIdParam = searchParams.get("notebookId");
+
   const [isTyping, setIsTyping] = useState(false);
   const [showGraph, setShowGraph] = useState(true);
+  const [selectedNotebookId, setSelectedNotebookId] = useState<string | null>(null);
+  const [selectedDocIds, setSelectedDocIds] = useState<Set<string>>(new Set());
+  const [chatInput, setChatInput] = useState("");
+  const [isPasteModalOpen, setIsPasteModalOpen] = useState(false);
+  const [pasteTitle, setPasteTitle] = useState("");
+  const [pasteText, setPasteText] = useState("");
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      role: "assistant",
+      content: "I've fully ingested your workspace documents. The vectors are mapped and the knowledge graph is ready. How would you like to explore your notes and sources today?",
+    }
+  ]);
+
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
 
-  // For demo purposes, we will use a hardcoded default workspace_id, but usually this comes from router/props.
-  const DEFAULT_WORKSPACE_ID = "default_workspace_id";
-
-  const { data: documents = [], isLoading: isLoadingDocuments } = useQuery({
-    queryKey: ['documents'],
-    queryFn: () => fetchDocuments(),
+  // Fetch notebooks (folders)
+  const { data: notebooks = [], isLoading: isLoadingNotebooks } = useQuery({
+    queryKey: ['notebooks'],
+    queryFn: () => fetchNotebooks(),
   });
 
-  const uploadMutation = useMutation({
-    mutationFn: (file: File) => uploadDocument(file, DEFAULT_WORKSPACE_ID),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['documents'] });
-    },
-    onError: (error) => {
-      console.error("Upload failed", error);
-      // Fallback: invalidate anyway so we get any server updates
-      queryClient.invalidateQueries({ queryKey: ['documents'] });
+  // Sync state selection when URL parameter changes
+  useEffect(() => {
+    if (notebookIdParam) {
+      setSelectedNotebookId(notebookIdParam);
     }
-  });
+  }, [notebookIdParam]);
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      uploadMutation.mutate(file);
+  // Set default selected notebook only if there's no URL param and no active selection
+  useEffect(() => {
+    if (notebooks.length > 0 && !selectedNotebookId && !notebookIdParam) {
+      setSelectedNotebookId(notebooks[0].id);
     }
+  }, [notebooks, selectedNotebookId, notebookIdParam]);
+
+  // Helper to select notebook and update the URL
+  const handleSelectNotebook = (id: string) => {
+    setSelectedNotebookId(id);
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("notebookId", id);
+    router.replace(`${pathname}?${params.toString()}`);
   };
 
+  // Fetch documents for the selected notebook
+  // Poll every 3 seconds while any document is pending/processing
+  const { data: documents = [], isLoading: isLoadingDocuments } = useQuery({
+    queryKey: ['documents', selectedNotebookId],
+    queryFn: () => fetchDocuments(selectedNotebookId || undefined),
+    enabled: !!selectedNotebookId,
+    refetchInterval: (query) => {
+      const docs = query.state.data as Document[] | undefined;
+      if (!docs) return 3000;
+      const hasActive = docs.some(
+        (d) => d.status === 'pending' || d.status === 'processing'
+      );
+      return hasActive ? 3000 : false;
+    },
+  });
+
+  // Scroll to bottom of chat when new messages arrive
   useEffect(() => {
-    // Auto-resize textarea
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, isTyping]);
+
+  // Auto-resize textarea
+  useEffect(() => {
     const handleInput = () => {
       if (textareaRef.current) {
         textareaRef.current.style.height = 'auto';
@@ -60,47 +123,280 @@ export default function WorkspacePage() {
     return () => { if (ta) ta.removeEventListener('input', handleInput); };
   }, []);
 
+  // Upload Mutation
+  const uploadMutation = useMutation({
+    mutationFn: (file: File) =>
+      uploadDocument(file, selectedNotebookId || undefined, (pct) =>
+        setUploadProgress(pct)
+      ),
+    onSuccess: () => {
+      setUploadError(null);
+      setUploadProgress(null);
+      queryClient.invalidateQueries({ queryKey: ['documents', selectedNotebookId] });
+    },
+    onError: (error: any) => {
+      setUploadProgress(null);
+      const msg = error?.response?.data?.detail || error?.message || "Upload failed. Check that the backend is running and MinIO is accessible.";
+      setUploadError(msg);
+      console.error("Upload failed", error);
+      queryClient.invalidateQueries({ queryKey: ['documents', selectedNotebookId] });
+    }
+  });
+
+  // Paste Text Mutation
+  const pasteMutation = useMutation({
+    mutationFn: ({ text, title }: { text: string; title: string }) => 
+      ingestText(text, title, selectedNotebookId || undefined),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['documents', selectedNotebookId] });
+      setIsPasteModalOpen(false);
+      setPasteText("");
+      setPasteTitle("");
+    },
+    onError: (error) => {
+      console.error("Pasted text ingestion failed", error);
+      alert("Failed to ingest pasted text: " + (error as any).message);
+    }
+  });
+
+  // Delete Document Mutation
+  const deleteDocumentMutation = useMutation({
+    mutationFn: (documentId: string) => deleteDocument(documentId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['documents', selectedNotebookId] });
+    },
+    onError: (error) => {
+      console.error("Failed to delete document", error);
+      alert("Failed to delete document.");
+    }
+  });
+
+  // Create Notebook (Folder) Mutation
+  const createNotebookMutation = useMutation({
+    mutationFn: (name: string) => createNotebook(name),
+    onSuccess: (newNotebook) => {
+      queryClient.invalidateQueries({ queryKey: ['notebooks'] });
+      setSelectedNotebookId(newNotebook.id);
+      
+      // Update URL search parameters
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("notebookId", newNotebook.id);
+      router.replace(`${pathname}?${params.toString()}`);
+    },
+    onError: (error: any) => {
+      console.error("Failed to create folder", error);
+      alert("Failed to create folder: " + (error.message || "Unknown error"));
+    }
+  });
+
+  const handleCreateFolder = () => {
+    const name = window.prompt("Enter new folder/notebook name:");
+    if (name && name.trim()) {
+      createNotebookMutation.mutate(name.trim());
+    }
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (files && files.length > 0) {
+      setUploadError(null);
+      // Upload files sequentially — not in parallel — to avoid connection conflicts
+      for (const file of Array.from(files)) {
+        await uploadMutation.mutateAsync(file).catch(() => {});
+      }
+    }
+    e.target.value = "";
+  };
+
+  const toggleDocSelection = (docId: string) => {
+    setSelectedDocIds(prev => {
+      const next = new Set(prev);
+      if (next.has(docId)) next.delete(docId);
+      else next.add(docId);
+      return next;
+    });
+  };
+
+  // Reset doc selection when notebook changes
+  useEffect(() => {
+    setSelectedDocIds(new Set());
+  }, [selectedNotebookId]);
+
+  const handleSendMessage = async () => {
+    if (!chatInput.trim() || !selectedNotebookId) return;
+
+    const userMsg = chatInput.trim();
+    setChatInput("");
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+    }
+
+    // Append user message
+    setMessages((prev) => [...prev, { role: "user", content: userMsg }]);
+    setIsTyping(true);
+
+    try {
+      const response = await sendChatMessage(
+        userMsg,
+        selectedNotebookId,
+        selectedDocIds.size > 0 ? Array.from(selectedDocIds) : undefined
+      );
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        content: response.response,
+        citations: response.citations
+      }]);
+    } catch (error) {
+      console.error("Chat error:", error);
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        content: "Sorry, I encountered an error while processing your request. Please check if your backend server and external AI models are correctly configured."
+      }]);
+    } finally {
+      setIsTyping(false);
+    }
+  };
+
+  const activeNotebook = notebooks.find(n => n.id === selectedNotebookId);
+
   return (
     <div className="flex h-[calc(100vh-64px)] overflow-hidden w-full bg-background relative selection:bg-primary/30 selection:text-primary">
       
       {/* Left Pane: Document Explorer */}
       <div className="w-[300px] flex-shrink-0 border-r border-white/10 bg-surface/30 backdrop-blur-md flex flex-col hidden lg:flex">
         <div className="p-4 border-b border-white/10 flex items-center justify-between">
-          <h3 className="font-display font-semibold">Active Sources</h3>
-          <AnimatedButton variant="ghost" size="icon" className="h-8 w-8 text-primary">
-            <Plus className="w-4 h-4" />
+          <h3 className="font-display font-semibold text-foreground">Active Sources</h3>
+          <AnimatedButton 
+            variant="ghost" 
+            size="icon" 
+            className="h-8 w-8 text-primary"
+            onClick={handleCreateFolder}
+            disabled={createNotebookMutation.isPending}
+          >
+            {createNotebookMutation.isPending ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Plus className="w-4 h-4" />
+            )}
           </AnimatedButton>
         </div>
 
         <div className="p-4 flex-1 overflow-y-auto no-scrollbar space-y-6">
-          {/* Folders */}
+          {/* Folders (Notebooks) */}
           <div className="space-y-1">
-            <div className="flex items-center gap-2 px-2 py-1.5 text-sm text-muted-foreground hover:text-foreground cursor-pointer transition-colors rounded-lg hover:bg-white/5">
-              <Folder className="w-4 h-4" /> Quantum Mechanics
-            </div>
-            <div className="flex items-center gap-2 px-2 py-1.5 text-sm text-muted-foreground hover:text-foreground cursor-pointer transition-colors rounded-lg hover:bg-white/5">
-              <Folder className="w-4 h-4" /> Lab Notes 2024
-            </div>
+            <div className="text-xs font-mono text-muted-foreground mb-2 px-2 uppercase tracking-wider">Notebooks</div>
+            {isLoadingNotebooks ? (
+              <div className="text-xs text-muted-foreground px-2 py-2 flex items-center gap-2">
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" /> Loading folders...
+              </div>
+            ) : notebooks.length === 0 ? (
+              <div className="text-xs text-muted-foreground px-2 py-2">No folders yet. Click '+' to add.</div>
+            ) : (
+              notebooks.map((nb) => (
+                <div
+                  key={nb.id}
+                  onClick={() => handleSelectNotebook(nb.id)}
+                  className={cn(
+                    "flex items-center gap-2 px-2 py-1.5 text-sm cursor-pointer transition-all rounded-lg border",
+                    selectedNotebookId === nb.id 
+                      ? "text-primary bg-primary/10 border-primary/20 font-medium" 
+                      : "text-muted-foreground hover:text-foreground hover:bg-white/5 border-transparent"
+                  )}
+                >
+                  <Folder className="w-4 h-4 flex-shrink-0" />
+                  <span className="truncate">{nb.title}</span>
+                </div>
+              ))
+            )}
           </div>
 
-          {/* Files */}
+          {/* Files (Documents) */}
           <div>
-            <div className="text-xs font-mono text-muted-foreground mb-3 px-2 uppercase tracking-wider">Vectorized Documents</div>
+            <div className="text-xs font-mono text-muted-foreground mb-3 px-2 uppercase tracking-wider flex items-center justify-between">
+              <span>Vectorized Documents</span>
+              {documents.length > 0 && (
+                <button
+                  onClick={() => {
+                    const doneDocs = documents.filter(d => d.status === 'done');
+                    if (selectedDocIds.size === doneDocs.length && doneDocs.length > 0) {
+                      setSelectedDocIds(new Set());
+                    } else {
+                      setSelectedDocIds(new Set(doneDocs.map(d => d.id)));
+                    }
+                  }}
+                  className="text-[10px] text-primary hover:text-primary/80 transition-colors flex items-center gap-1 font-sans normal-case tracking-normal"
+                  title={selectedDocIds.size > 0 ? "Clear selection" : "Select all ready docs"}
+                >
+                  {selectedDocIds.size > 0 ? (
+                    <><CheckCheck className="w-3 h-3" /> Clear</>
+                  ) : (
+                    <><CheckSquare className="w-3 h-3" /> All</>
+                  )}
+                </button>
+              )}
+            </div>
             <div className="space-y-2">
-              {isLoadingDocuments ? (
-                <div className="text-center text-xs text-muted-foreground py-4">Loading...</div>
+              {!selectedNotebookId ? (
+                <div className="text-center text-xs text-muted-foreground py-4">Select a folder to view documents.</div>
+              ) : isLoadingDocuments ? (
+                <div className="text-center text-xs text-muted-foreground py-4 flex items-center justify-center gap-2">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" /> Loading...
+                </div>
               ) : documents.length === 0 ? (
-                <div className="text-center text-xs text-muted-foreground py-4">No documents yet.</div>
+                <div className="text-center text-xs text-muted-foreground py-4">No documents in this notebook yet.</div>
               ) : (
                 documents.map((doc: Document) => (
-                  <div key={doc.id} className="flex items-start gap-3 p-3 rounded-xl border border-transparent hover:bg-white/5 cursor-pointer transition-all group">
-                    <FileText className="w-5 h-5 text-blue-400 mt-0.5" />
-                    <div className="overflow-hidden">
+                  <div
+                    key={doc.id}
+                    className={cn(
+                      "flex items-start gap-2 p-3 rounded-xl border transition-all group cursor-pointer",
+                      selectedDocIds.has(doc.id)
+                        ? "border-primary/40 bg-primary/10"
+                        : "border-transparent hover:bg-white/5"
+                    )}
+                    onClick={() => doc.status === 'done' && toggleDocSelection(doc.id)}
+                  >
+                    {/* Checkbox */}
+                    <div className={cn(
+                      "mt-0.5 w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center transition-all",
+                      doc.status === 'done'
+                        ? selectedDocIds.has(doc.id)
+                          ? "border-primary bg-primary"
+                          : "border-white/20 group-hover:border-primary/50"
+                        : "border-white/10 opacity-30"
+                    )}>
+                      {selectedDocIds.has(doc.id) && (
+                        <svg className="w-2.5 h-2.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                        </svg>
+                      )}
+                    </div>
+                    <FileText className="w-4 h-4 text-blue-400 mt-0.5 flex-shrink-0" />
+                    <div className="overflow-hidden flex-1 min-w-0">
                       <p className="text-sm font-medium text-muted-foreground truncate group-hover:text-foreground transition-colors">{doc.file_name}</p>
                       <div className="flex gap-2 mt-1">
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface border border-white/10 text-muted-foreground uppercase">{doc.status}</span>
+                        <span className={cn(
+                          "text-[10px] px-1.5 py-0.5 rounded bg-surface border uppercase font-mono",
+                          doc.status === "done" ? "border-green-500/20 text-green-400" :
+                          doc.status === "processing" ? "border-yellow-500/20 text-yellow-400" :
+                          doc.status === "error" ? "border-red-500/20 text-red-400" :
+                          "border-white/10 text-muted-foreground"
+                        )}>
+                          {doc.status}
+                        </span>
                       </div>
                     </div>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteDocumentMutation.mutate(doc.id);
+                      }}
+                      disabled={deleteDocumentMutation.isPending}
+                      className="opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded-lg hover:bg-red-500/10 text-muted-foreground hover:text-red-400 flex-shrink-0"
+                      title="Delete document"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 ))
               )}
@@ -114,12 +410,21 @@ export default function WorkspacePage() {
             type="file" 
             ref={fileInputRef} 
             onChange={handleFileUpload} 
-            className="hidden" 
+            className="hidden"
+            multiple
+            accept=".pdf,.doc,.docx,.ppt,.pptx,.txt,.md,.mp3,.wav,.m4a,.ogg,.flac,.webm,.aac,.png,.jpg,.jpeg,.tiff,.bmp"
           />
           <div 
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => {
+              if (selectedNotebookId) {
+                fileInputRef.current?.click();
+              } else {
+                alert("Please select or create a notebook folder first.");
+              }
+            }}
             className={cn(
               "border border-dashed border-white/20 rounded-xl p-4 text-center cursor-pointer transition-all",
+              !selectedNotebookId && "opacity-50 cursor-not-allowed",
               uploadMutation.isPending ? "border-primary/50 bg-primary/10" : "hover:border-primary/50 hover:bg-primary/5"
             )}
           >
@@ -130,10 +435,39 @@ export default function WorkspacePage() {
                 <Plus className="w-4 h-4 text-muted-foreground" />
               )}
             </div>
-            <span className="text-xs text-muted-foreground">
-              {uploadMutation.isPending ? "Uploading..." : "Drop files or click to add"}
+            <span className="text-xs text-muted-foreground block">
+              {uploadMutation.isPending
+                ? uploadProgress !== null
+                  ? `Uploading\u2026 ${uploadProgress}%`
+                  : "Uploading\u2026"
+                : "Drop files or click to add"}
             </span>
+            {/* Progress bar */}
+            {uploadMutation.isPending && uploadProgress !== null && (
+              <div className="w-full h-1 bg-white/10 rounded-full mt-2 overflow-hidden">
+                <div
+                  className="h-full bg-primary transition-all duration-200 rounded-full"
+                  style={{ width: `${uploadProgress}%` }}
+                />
+              </div>
+            )}
           </div>
+
+          {uploadError && (
+            <div className="mt-2 p-2 rounded-lg bg-red-500/10 border border-red-500/20 text-xs text-red-400 leading-relaxed">
+              <strong>Upload error:</strong> {uploadError}
+            </div>
+          )}
+
+          <AnimatedButton
+            className="w-full h-9 mt-3 text-xs"
+            variant="outline"
+            onClick={() => setIsPasteModalOpen(true)}
+            disabled={!selectedNotebookId || pasteMutation.isPending}
+          >
+            <FileText className="w-3.5 h-3.5 mr-1.5" />
+            {pasteMutation.isPending ? "Ingesting..." : "Paste Text"}
+          </AnimatedButton>
         </div>
       </div>
 
@@ -141,7 +475,26 @@ export default function WorkspacePage() {
       <div className="flex-1 flex flex-col relative bg-gradient-to-b from-transparent to-surface/20 min-w-0">
         
         {/* Header Controls */}
-        <div className="absolute top-0 inset-x-0 p-4 flex justify-end z-20 pointer-events-none">
+        <div className="absolute top-0 inset-x-0 p-4 flex justify-between items-center z-20 pointer-events-none">
+          <div className="pointer-events-auto flex items-center gap-2">
+            <div className="bg-surface/80 backdrop-blur border border-white/5 rounded-full px-3 py-1 text-xs text-muted-foreground flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+              Notebook: <span className="text-foreground font-medium truncate max-w-[120px]">{activeNotebook?.title || "None Selected"}</span>
+            </div>
+            {selectedDocIds.size > 0 && (
+              <div className="bg-primary/15 backdrop-blur border border-primary/30 rounded-full px-3 py-1 text-xs text-primary flex items-center gap-1.5">
+                <Filter className="w-3 h-3" />
+                {selectedDocIds.size} file{selectedDocIds.size > 1 ? 's' : ''} selected
+                <button
+                  onClick={() => setSelectedDocIds(new Set())}
+                  className="ml-1 hover:text-white transition-colors"
+                  title="Clear filter"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            )}
+          </div>
           <div className="pointer-events-auto flex gap-2">
             <AnimatedButton 
               variant="outline" 
@@ -157,60 +510,53 @@ export default function WorkspacePage() {
 
         {/* Chat History */}
         <div className="flex-1 overflow-y-auto no-scrollbar p-4 md:p-8 pt-16 pb-40 space-y-8 scroll-smooth">
-          
-          <div className="max-w-3xl mx-auto flex gap-4">
-            <div className="w-10 h-10 rounded-full flex-shrink-0 bg-primary/20 border border-primary/30 flex items-center justify-center shadow-[0_0_15px_rgba(192,193,255,0.2)]">
-              <Bot className="w-5 h-5 text-primary" />
-            </div>
-            <GlassCard className="rounded-tl-none p-5 max-w-[85%] border-primary/20" hoverEffect={false}>
-              <p className="text-[15px] leading-relaxed text-foreground/90">
-                I've fully ingested the <span className="text-primary font-medium">Schrödinger Wave</span> documents. 
-                The vectors have been mapped and the knowledge graph is ready. 
-                <br/><br/>
-                I notice a significant contradiction between Chapter 4 and your Lab Notes regarding the measurement problem. How would you like to explore this?
-              </p>
-            </GlassCard>
-          </div>
-
-          <div className="max-w-3xl mx-auto flex gap-4 flex-row-reverse">
-            <div className="w-10 h-10 rounded-full flex-shrink-0 border border-white/10 overflow-hidden">
-              <img src="https://lh3.googleusercontent.com/aida-public/AB6AXuCOUGMDJ6qCRZjYEyz3UTTpLJMFJCHxh62pB8ZY9BFwguOM5ynLuFPOxP_DsoXJVSi5uOZNrxP0mBTH-FECu6qxtxYvTP-BJGZvC_JWH7-hr2Sri-qH0XysODmZwDgzL3kgygpderG7VwCvG9fs8_xDShaHpkD0kSkxxc1kx7dXeStdkfkaQaj1VYwTFpTEXEQjwZbCW9ZyOI-BKVdXiAep68fE_nMt4plDsY44OL0PgXdDtuD-zwntQHcG9e5JzXPARThJzG8YFVAS" alt="User" />
-            </div>
-            <div className="bg-surface-hover border border-white/10 rounded-2xl rounded-tr-none p-5 max-w-[85%]">
-              <p className="text-[15px] leading-relaxed text-foreground">
-                Summarize the contradiction specifically focusing on the collapse mechanisms proposed. Include citations.
-              </p>
-            </div>
-          </div>
-
-          <div className="max-w-3xl mx-auto flex gap-4">
-            <div className="w-10 h-10 rounded-full flex-shrink-0 bg-primary/20 border border-primary/30 flex items-center justify-center shadow-[0_0_15px_rgba(192,193,255,0.2)]">
-              <Bot className="w-5 h-5 text-primary" />
-            </div>
-            <GlassCard className="rounded-tl-none p-5 max-w-[85%] border-primary/20" hoverEffect={false}>
-              <p className="text-[15px] leading-relaxed text-foreground/90 mb-4">
-                Based on the sources, the core contradiction lies in whether the wave collapse is a physical mechanism or an epistemological update:
-                <br/><br/>
-                1. <span className="text-foreground font-medium">Chapter 4 (Source)</span> argues for objective collapse models, suggesting a physical threshold based on mass-energy density 
-                <span className="inline-flex items-center justify-center bg-primary/20 text-primary text-[10px] font-bold px-1.5 py-0.5 rounded ml-1 cursor-pointer hover:bg-primary hover:text-[#0b1326] transition-colors">[1]</span>.
-                <br/><br/>
-                2. <span className="text-foreground font-medium">Your Lab Notes</span> lean heavily towards the Copenhagen interpretation, treating the collapse entirely as an update in the observer's knowledge 
-                <span className="inline-flex items-center justify-center bg-accent/20 text-accent text-[10px] font-bold px-1.5 py-0.5 rounded ml-1 cursor-pointer hover:bg-accent hover:text-[#0b1326] transition-colors">[2]</span>.
-              </p>
-              
-              {/* Citations block */}
-              <div className="mt-4 pt-4 border-t border-white/10 grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div className="p-3 rounded-lg bg-black/20 border border-white/5 hover:border-primary/30 cursor-pointer transition-colors group">
-                  <div className="text-[10px] font-mono text-primary mb-1">[1] Schrodinger_Wave.pdf</div>
-                  <p className="text-xs text-muted-foreground line-clamp-2 group-hover:text-foreground transition-colors">"...the state vector undergoes a physical reduction governed by non-linear stochastic processes..."</p>
-                </div>
-                <div className="p-3 rounded-lg bg-black/20 border border-white/5 hover:border-accent/30 cursor-pointer transition-colors group">
-                  <div className="text-[10px] font-mono text-accent mb-1">[2] Lab Notes 2024</div>
-                  <p className="text-xs text-muted-foreground line-clamp-2 group-hover:text-foreground transition-colors">"...if we treat ψ purely as probability, the measurement problem disappears into epistemology."</p>
-                </div>
+          {messages.map((msg, index) => {
+            const isBot = msg.role === "assistant";
+            return (
+              <div key={index} className={cn("max-w-3xl mx-auto flex gap-4", !isBot && "flex-row-reverse")}>
+                {isBot ? (
+                  <div className="w-10 h-10 rounded-full flex-shrink-0 bg-primary/20 border border-primary/30 flex items-center justify-center shadow-[0_0_15px_rgba(192,193,255,0.2)]">
+                    <Bot className="w-5 h-5 text-primary" />
+                  </div>
+                ) : (
+                  <div className="w-10 h-10 rounded-full flex-shrink-0 border border-white/10 overflow-hidden bg-primary/10 flex items-center justify-center">
+                    <span className="text-xs font-mono font-bold text-muted-foreground">U</span>
+                  </div>
+                )}
+                
+                {isBot ? (
+                  <GlassCard className="rounded-tl-none p-5 max-w-[85%] border-primary/20" hoverEffect={false}>
+                    <div className="text-[15px] leading-relaxed text-foreground/90 whitespace-pre-wrap font-sans">
+                      {msg.content}
+                    </div>
+                    {msg.citations && msg.citations.length > 0 && (
+                      <div className="mt-4 pt-4 border-t border-white/10">
+                        <div className="text-xs font-semibold text-foreground mb-2 flex items-center gap-1">
+                          <Sparkles className="w-3.5 h-3.5 text-primary" /> Source Citations
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          {msg.citations.map((cit, cIdx) => (
+                            <div key={cIdx} className="p-3 rounded-lg bg-black/20 border border-white/5 hover:border-primary/30 cursor-pointer transition-colors group">
+                              <div className="text-[10px] font-mono text-primary mb-1">[{cIdx + 1}] {cit.file_name}</div>
+                              <p className="text-xs text-muted-foreground line-clamp-2 group-hover:text-foreground transition-colors">
+                                {cit.text}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </GlassCard>
+                ) : (
+                  <div className="bg-surface-hover border border-white/10 rounded-2xl rounded-tr-none p-5 max-w-[85%]">
+                    <p className="text-[15px] leading-relaxed text-foreground whitespace-pre-wrap font-sans">
+                      {msg.content}
+                    </p>
+                  </div>
+                )}
               </div>
-            </GlassCard>
-          </div>
+            );
+          })}
 
           {/* Typing Indicator */}
           <AnimatePresence>
@@ -224,7 +570,7 @@ export default function WorkspacePage() {
                 <div className="w-10 h-10 rounded-full flex-shrink-0 bg-primary/20 border border-primary/30 flex items-center justify-center">
                   <Bot className="w-5 h-5 text-primary" />
                 </div>
-                <div className="glass rounded-2xl rounded-tl-none py-4 px-6 flex items-center gap-2">
+                <div className="glass rounded-2xl rounded-tl-none py-4 px-6 flex items-center gap-2 bg-surface/80 border-white/10 border">
                   <motion.div animate={{ y: [0, -5, 0] }} transition={{ duration: 0.6, repeat: Infinity }} className="w-2 h-2 rounded-full bg-primary/60" />
                   <motion.div animate={{ y: [0, -5, 0] }} transition={{ duration: 0.6, delay: 0.2, repeat: Infinity }} className="w-2 h-2 rounded-full bg-primary/60" />
                   <motion.div animate={{ y: [0, -5, 0] }} transition={{ duration: 0.6, delay: 0.4, repeat: Infinity }} className="w-2 h-2 rounded-full bg-primary/60" />
@@ -232,50 +578,108 @@ export default function WorkspacePage() {
               </motion.div>
             )}
           </AnimatePresence>
+          <div ref={chatEndRef} />
         </div>
 
         {/* Input Area */}
         <div className="absolute bottom-0 inset-x-0 p-4 md:p-8 bg-gradient-to-t from-background via-background/95 to-transparent">
           <div className="max-w-3xl mx-auto relative">
+            {/* Selected document chips */}
+            {selectedDocIds.size > 0 && (
+              <div className="absolute -top-24 left-0 w-full flex items-center gap-2 overflow-x-auto no-scrollbar pb-1 px-1">
+                <span className="text-[10px] text-muted-foreground flex-shrink-0 flex items-center gap-1">
+                  <Filter className="w-3 h-3 text-primary" /> Asking only:
+                </span>
+                {Array.from(selectedDocIds).map(id => {
+                  const doc = documents.find(d => d.id === id);
+                  if (!doc) return null;
+                  return (
+                    <span
+                      key={id}
+                      className="flex-shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-primary/10 border border-primary/25 text-[11px] text-primary font-medium max-w-[160px]"
+                    >
+                      <FileText className="w-3 h-3 flex-shrink-0" />
+                      <span className="truncate">{doc.file_name}</span>
+                      <button
+                        onClick={() => toggleDocSelection(id)}
+                        className="ml-0.5 text-primary/60 hover:text-primary transition-colors flex-shrink-0"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </span>
+                  );
+                })}
+                <button
+                  onClick={() => setSelectedDocIds(new Set())}
+                  className="flex-shrink-0 text-[10px] text-muted-foreground hover:text-foreground transition-colors px-2 py-1 rounded-full border border-white/10 hover:border-white/20"
+                >
+                  Clear all
+                </button>
+              </div>
+            )}
             <div className="absolute -top-12 left-0 flex gap-2 overflow-x-auto no-scrollbar w-full pb-2 mask-linear-fade">
-              <button className="whitespace-nowrap px-4 py-1.5 rounded-full bg-surface border border-white/5 text-xs text-muted-foreground hover:text-primary hover:border-primary/30 transition-all">
-                Explain the stochastic processes
+              <button 
+                onClick={() => {
+                  if (selectedNotebookId && !isTyping) {
+                    setChatInput("Summarize the key information contained in this notebook.");
+                    textareaRef.current?.focus();
+                  }
+                }}
+                className="whitespace-nowrap px-4 py-1.5 rounded-full bg-surface border border-white/5 text-xs text-muted-foreground hover:text-primary hover:border-primary/30 transition-all cursor-pointer"
+              >
+                Summarize notebook
               </button>
-              <button className="whitespace-nowrap px-4 py-1.5 rounded-full bg-surface border border-white/5 text-xs text-muted-foreground hover:text-accent hover:border-accent/30 transition-all">
-                Contrast with Many-Worlds
+              <button 
+                onClick={() => {
+                  if (selectedNotebookId && !isTyping) {
+                    setChatInput("Contrast the main concepts discussed in our documents.");
+                    textareaRef.current?.focus();
+                  }
+                }}
+                className="whitespace-nowrap px-4 py-1.5 rounded-full bg-surface border border-white/5 text-xs text-muted-foreground hover:text-accent hover:border-accent/30 transition-all cursor-pointer"
+              >
+                Contrast main concepts
               </button>
             </div>
 
             <div className="glass rounded-[24px] p-2 flex items-end gap-2 border-white/20 shadow-2xl focus-within:border-primary/50 transition-colors bg-surface/80">
-              <button className="p-3 text-muted-foreground hover:text-foreground transition-colors rounded-xl hover:bg-white/5 mb-0.5">
+              <button className="p-3 text-muted-foreground hover:text-foreground transition-colors rounded-xl hover:bg-white/5 mb-0.5 cursor-pointer">
                 <Paperclip className="w-5 h-5" />
               </button>
               
               <textarea
                 ref={textareaRef}
-                placeholder="Ask your AI research assistant..."
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                placeholder={!selectedNotebookId ? "Please select or create a folder/notebook folder first..." : selectedDocIds.size > 0 ? `Ask about ${selectedDocIds.size} selected file${selectedDocIds.size > 1 ? 's' : ''}...` : "Ask your AI research assistant (all documents)..."}
+                disabled={!selectedNotebookId || isTyping}
                 className="flex-1 bg-transparent border-none focus:ring-0 text-[15px] resize-none py-3.5 max-h-[200px] outline-none text-foreground placeholder:text-muted-foreground no-scrollbar"
                 rows={1}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault();
-                    setIsTyping(true);
-                    setTimeout(() => setIsTyping(false), 3000);
+                    handleSendMessage();
                   }
                 }}
               />
 
               <div className="flex gap-1 mb-0.5 pr-1">
-                <button className="p-2 text-muted-foreground hover:text-foreground transition-colors rounded-xl hover:bg-white/5 hidden sm:block">
+                <button className="p-2 text-muted-foreground hover:text-foreground transition-colors rounded-xl hover:bg-white/5 hidden sm:block cursor-pointer">
                   <Mic className="w-5 h-5" />
                 </button>
-                <AnimatedButton variant="primary" size="icon" className="w-10 h-10 rounded-[14px]">
+                <AnimatedButton 
+                  variant="primary" 
+                  size="icon" 
+                  className="w-10 h-10 rounded-[14px]"
+                  onClick={handleSendMessage}
+                  disabled={!selectedNotebookId || isTyping || !chatInput.trim()}
+                >
                   <Send className="w-4 h-4 ml-0.5" />
                 </AnimatedButton>
               </div>
             </div>
             <div className="text-center mt-2">
-              <span className="text-[10px] text-muted-foreground font-mono">OpenNotebook OS - GPT-4o Enhanced Mode</span>
+              <span className="text-[10px] text-muted-foreground font-mono">OpenNotebook OS - Llama-3 RAG Active</span>
             </div>
           </div>
         </div>
@@ -291,10 +695,10 @@ export default function WorkspacePage() {
             className="flex-shrink-0 border-l border-white/10 bg-surface/30 backdrop-blur-md hidden xl:flex flex-col relative"
           >
             <div className="p-4 border-b border-white/10 flex items-center justify-between">
-              <h3 className="font-display font-semibold flex items-center gap-2">
+              <h3 className="font-display font-semibold flex items-center gap-2 text-foreground">
                 <Network className="w-4 h-4 text-primary" /> Semantic Graph
               </h3>
-              <button onClick={() => setShowGraph(false)} className="text-muted-foreground hover:text-foreground">
+              <button onClick={() => setShowGraph(false)} className="text-muted-foreground hover:text-foreground cursor-pointer">
                 <X className="w-4 h-4" />
               </button>
             </div>
@@ -329,7 +733,7 @@ export default function WorkspacePage() {
               </motion.div>
 
               <div className="absolute bottom-4 inset-x-0 text-center opacity-0 group-hover:opacity-100 transition-opacity">
-                <span className="text-xs font-mono bg-black/50 px-3 py-1 rounded-full border border-white/10 backdrop-blur">Click to expand graph</span>
+                <span className="text-xs font-mono bg-black/50 px-3 py-1 rounded-full border border-white/10 backdrop-blur text-foreground">Click to expand graph</span>
               </div>
             </div>
 
@@ -338,7 +742,10 @@ export default function WorkspacePage() {
                 <Sparkles className="w-3 h-3" /> Auto-Generated Summary
               </h4>
               <p className="text-xs text-muted-foreground leading-relaxed mb-4">
-                The nodes indicate a strong semantic cluster around the measurement problem, drawing primarily from 14 citations across 3 documents. The "Objective" node represents the highest divergence from the central consensus.
+                {selectedNotebookId && documents.length > 0 
+                  ? `Active research folder: "${activeNotebook?.title || "Selected"}". Contains ${documents.length} vectorized document(s). The semantic knowledge graph is fully compiled and ready for conversational exploration.`
+                  : "This notebook folder is currently empty. Upload files or scrape websites to start generating interactive semantic connections and visual knowledge graphs."
+                }
               </p>
               <AnimatedButton variant="outline" size="sm" className="w-full text-xs">
                 Export Analysis
@@ -347,7 +754,87 @@ export default function WorkspacePage() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Paste Text Modal */}
+      <AnimatePresence>
+        {isPasteModalOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-surface border border-white/10 rounded-2xl p-6 w-full max-w-2xl shadow-2xl flex flex-col gap-4 relative"
+            >
+              <button 
+                onClick={() => setIsPasteModalOpen(false)}
+                className="absolute top-4 right-4 text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+              <h3 className="text-lg font-semibold flex items-center gap-2">
+                <FileText className="w-5 h-5 text-primary" />
+                Paste Text
+              </h3>
+              <div className="flex flex-col gap-2">
+                <label className="text-xs font-medium text-muted-foreground">Title (Optional)</label>
+                <input
+                  type="text"
+                  value={pasteTitle}
+                  onChange={(e) => setPasteTitle(e.target.value)}
+                  placeholder="e.g. Meeting Notes, Web Snippet"
+                  className="bg-surface-light border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary/50 text-foreground"
+                />
+              </div>
+              <div className="flex flex-col gap-2 flex-1">
+                <label className="text-xs font-medium text-muted-foreground">Content *</label>
+                <textarea
+                  value={pasteText}
+                  onChange={(e) => setPasteText(e.target.value)}
+                  placeholder="Paste your thousands of lines of text here..."
+                  className="bg-surface-light border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary/50 text-foreground resize-none h-64"
+                />
+              </div>
+              <div className="flex justify-end gap-3 mt-2">
+                <AnimatedButton 
+                  variant="outline" 
+                  onClick={() => setIsPasteModalOpen(false)}
+                >
+                  Cancel
+                </AnimatedButton>
+                <AnimatedButton 
+                  variant="primary" 
+                  onClick={() => pasteMutation.mutate({ text: pasteText, title: pasteTitle })}
+                  disabled={!pasteText.trim() || pasteMutation.isPending}
+                >
+                  {pasteMutation.isPending ? (
+                    <span className="flex items-center gap-2">
+                      <Loader2 className="w-4 h-4 animate-spin" /> Ingesting...
+                    </span>
+                  ) : "Ingest Text"}
+                </AnimatedButton>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       
     </div>
+  );
+}
+
+export default function WorkspacePage() {
+  return (
+    <Suspense fallback={
+      <div className="flex h-screen items-center justify-center bg-background">
+        <Loader2 className="w-8 h-8 animate-spin text-primary" />
+      </div>
+    }>
+      <WorkspaceContent />
+    </Suspense>
   );
 }

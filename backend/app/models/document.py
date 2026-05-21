@@ -21,6 +21,7 @@ class Document(Base):
     file_path = Column(String, nullable=False)
     file_type = Column(String, nullable=False)
     status = Column(Enum(DocumentStatus), default=DocumentStatus.pending)
+    error_message = Column(String, nullable=True)  # stores reason for error status
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Relationships

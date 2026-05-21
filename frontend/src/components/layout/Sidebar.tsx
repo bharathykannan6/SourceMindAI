@@ -1,8 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
+import { useQueryClient, useMutation } from "@tanstack/react-query";
+import { createNotebook } from "@/lib/api";
 import {
   LayoutDashboard,
   FileEdit,
@@ -19,6 +21,29 @@ import { AnimatedButton } from "../ui/AnimatedButton";
 
 export function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
+  const queryClient = useQueryClient();
+
+  const createNotebookMutation = useMutation({
+    mutationFn: (name: string) => createNotebook(name),
+    onSuccess: (newNotebook) => {
+      // Invalidate queries for notebooks so the list refreshes
+      queryClient.invalidateQueries({ queryKey: ['notebooks'] });
+      // Redirect to the workspace page and select the new notebook
+      router.push(`/workspace?notebookId=${newNotebook.id}`);
+    },
+    onError: (error: any) => {
+      console.error("Failed to create notebook:", error);
+      alert("Failed to create notebook: " + (error.message || "Unknown error"));
+    }
+  });
+
+  const handleCreateNotebook = () => {
+    const name = window.prompt("Enter new notebook name:");
+    if (name && name.trim()) {
+      createNotebookMutation.mutate(name.trim());
+    }
+  };
 
   const links = [
     { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
@@ -42,9 +67,15 @@ export function Sidebar() {
         </p>
       </div>
 
-      <AnimatedButton variant="primary" className="w-full mb-8" size="md">
+      <AnimatedButton 
+        variant="primary" 
+        className="w-full mb-8" 
+        size="md"
+        onClick={handleCreateNotebook}
+        disabled={createNotebookMutation.isPending}
+      >
         <Plus className="w-5 h-5" />
-        New Notebook
+        {createNotebookMutation.isPending ? "Creating..." : "New Notebook"}
       </AnimatedButton>
 
       <nav className="flex-1 space-y-1.5 overflow-y-auto no-scrollbar">

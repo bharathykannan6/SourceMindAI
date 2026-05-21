@@ -1,5 +1,6 @@
 from typing import Optional
-from pydantic import BaseModel, UUID4
+from uuid import UUID
+from pydantic import BaseModel
 from datetime import datetime
 
 class WorkspaceBase(BaseModel):
@@ -12,8 +13,8 @@ class WorkspaceUpdate(BaseModel):
     name: Optional[str] = None
 
 class WorkspaceInDBBase(WorkspaceBase):
-    id: UUID4
-    owner_id: UUID4
+    id: UUID
+    owner_id: UUID
     created_at: datetime
 
     model_config = {"from_attributes": True}

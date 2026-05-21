@@ -1,5 +1,5 @@
 from typing import Any, List
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -24,7 +24,7 @@ async def read_notebooks(
     if not workspace_result.scalars().first():
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    stmt = select(Notebook).where(Notebook.workspace_id == workspace_id)
+    stmt = select(Notebook).where(Notebook.workspace_id == workspace_id).order_by(Notebook.created_at.asc())
     result = await db.execute(stmt)
     return result.scalars().all()
 
@@ -50,12 +50,12 @@ async def create_notebook(
     await db.refresh(notebook)
     return notebook
 
-@router.delete("/{notebook_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{notebook_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 async def delete_notebook(
     notebook_id: str,
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user)
-) -> Any:
+) -> None:
     """Delete a notebook."""
     # Join with Workspace to verify ownership
     stmt = select(Notebook, Workspace).join(Workspace).where(

@@ -16,7 +16,7 @@ export default function DashboardPage() {
   const [mounted, setMounted] = useState(false);
   const { data: notebooks = [], isLoading: isLoadingNotebooks } = useQuery({
     queryKey: ['notebooks'],
-    queryFn: fetchNotebooks,
+    queryFn: () => fetchNotebooks(),
   });
 
   const { data: documents = [], isLoading: isLoadingDocuments } = useQuery({
