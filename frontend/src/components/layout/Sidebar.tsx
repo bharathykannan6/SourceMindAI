@@ -49,7 +49,6 @@ export function Sidebar() {
     { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
     { name: "Workspace", href: "/workspace", icon: FileEdit },
     { name: "Documents", href: "/documents", icon: Files },
-    { name: "AI Chat", href: "/chat", icon: MessageSquare },
     { name: "Podcast Studio", href: "/podcast", icon: Mic },
     { name: "Knowledge Graph", href: "/graph", icon: Network },
   ];

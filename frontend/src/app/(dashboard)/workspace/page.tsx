@@ -619,7 +619,7 @@ function WorkspaceContent() {
         </div>
 
         {/* Chat History */}
-        <div className="flex-1 overflow-y-auto no-scrollbar p-4 md:p-8 pt-16 pb-40 space-y-8 scroll-smooth">
+        <div className="flex-1 overflow-y-auto no-scrollbar p-4 md:p-8 pt-16 pb-4 space-y-8 scroll-smooth">
           {messages.map((msg, index) => {
             const isBot = msg.role === "assistant";
             return (
@@ -691,12 +691,13 @@ function WorkspaceContent() {
           <div ref={chatEndRef} />
         </div>
 
-        {/* Input Area */}
-        <div className="absolute bottom-0 inset-x-0 p-4 md:p-8 bg-gradient-to-t from-background via-background/95 to-transparent">
-          <div className="max-w-3xl mx-auto relative">
+        {/* Input Area — static, no absolute positioning, no overlap */}
+        <div className="flex-shrink-0 border-t border-white/10 bg-background/95 backdrop-blur-md px-4 md:px-8 py-4">
+          <div className="max-w-3xl mx-auto flex flex-col gap-2">
+
             {/* Selected document chips */}
             {selectedDocIds.size > 0 && (
-              <div className="absolute -top-24 left-0 w-full flex items-center gap-2 overflow-x-auto no-scrollbar pb-1 px-1">
+              <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1">
                 <span className="text-[10px] text-muted-foreground flex-shrink-0 flex items-center gap-1">
                   <Filter className="w-3 h-3 text-primary" /> Asking only:
                 </span>
@@ -727,31 +728,34 @@ function WorkspaceContent() {
                 </button>
               </div>
             )}
-            <div className="absolute -top-12 left-0 flex gap-2 overflow-x-auto no-scrollbar w-full pb-2 mask-linear-fade">
-              <button 
+
+            {/* Quick action suggestion chips */}
+            <div className="flex gap-2 overflow-x-auto no-scrollbar">
+              <button
                 onClick={() => {
                   if (selectedNotebookId && !isTyping) {
                     setChatInput("Summarize the key information contained in this notebook.");
                     textareaRef.current?.focus();
                   }
                 }}
-                className="whitespace-nowrap px-4 py-1.5 rounded-full bg-surface border border-white/5 text-xs text-muted-foreground hover:text-primary hover:border-primary/30 transition-all cursor-pointer"
+                className="whitespace-nowrap px-4 py-1.5 rounded-full bg-surface border border-white/5 text-xs text-muted-foreground hover:text-primary hover:border-primary/30 transition-all cursor-pointer flex-shrink-0"
               >
                 Summarize notebook
               </button>
-              <button 
+              <button
                 onClick={() => {
                   if (selectedNotebookId && !isTyping) {
                     setChatInput("Contrast the main concepts discussed in our documents.");
                     textareaRef.current?.focus();
                   }
                 }}
-                className="whitespace-nowrap px-4 py-1.5 rounded-full bg-surface border border-white/5 text-xs text-muted-foreground hover:text-accent hover:border-accent/30 transition-all cursor-pointer"
+                className="whitespace-nowrap px-4 py-1.5 rounded-full bg-surface border border-white/5 text-xs text-muted-foreground hover:text-accent hover:border-accent/30 transition-all cursor-pointer flex-shrink-0"
               >
                 Contrast main concepts
               </button>
             </div>
 
+            {/* Text input box */}
             <div className="glass rounded-[24px] p-2 flex items-end gap-2 border-white/20 shadow-2xl focus-within:border-primary/50 transition-colors bg-surface/80">
               <button
                 onClick={() => {
@@ -766,12 +770,12 @@ function WorkspaceContent() {
               >
                 <Paperclip className="w-5 h-5" />
               </button>
-              
+
               <textarea
                 ref={textareaRef}
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
-                placeholder={!selectedNotebookId ? "Please select or create a folder/notebook folder first..." : selectedDocIds.size > 0 ? `Ask about ${selectedDocIds.size} selected file${selectedDocIds.size > 1 ? 's' : ''}...` : "Ask your AI research assistant (all documents)..."}
+                placeholder={!selectedNotebookId ? "Please select or create a folder/notebook first..." : selectedDocIds.size > 0 ? `Ask about ${selectedDocIds.size} selected file${selectedDocIds.size > 1 ? 's' : ''}...` : "Ask your AI research assistant (all documents)..."}
                 disabled={!selectedNotebookId || isTyping}
                 className="flex-1 bg-transparent border-none focus:ring-0 text-[15px] resize-none py-3.5 max-h-[200px] outline-none text-foreground placeholder:text-muted-foreground no-scrollbar"
                 rows={1}
@@ -787,9 +791,9 @@ function WorkspaceContent() {
                 <button className="p-2 text-muted-foreground hover:text-foreground transition-colors rounded-xl hover:bg-white/5 hidden sm:block cursor-pointer">
                   <Mic className="w-5 h-5" />
                 </button>
-                <AnimatedButton 
-                  variant="primary" 
-                  size="icon" 
+                <AnimatedButton
+                  variant="primary"
+                  size="icon"
                   className="w-10 h-10 rounded-[14px]"
                   onClick={handleSendMessage}
                   disabled={!selectedNotebookId || isTyping || !chatInput.trim()}
@@ -798,7 +802,8 @@ function WorkspaceContent() {
                 </AnimatedButton>
               </div>
             </div>
-            <div className="text-center mt-2">
+
+            <div className="text-center">
               <span className="text-[10px] text-muted-foreground font-mono">OpenNotebook OS - Llama-3 RAG Active</span>
             </div>
           </div>

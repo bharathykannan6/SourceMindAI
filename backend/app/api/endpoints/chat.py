@@ -346,7 +346,212 @@ async def chat_with_notebook(
             score=float(score)
         ))
 
-    # 11. Build system prompt
+    # Build Groq key pool and model cascade early — used in both summary and RAG paths
+    groq_keys = [
+        k for k in [
+            settings.GROQ_API_KEY,
+            settings.GROQ_API_KEY_2,
+            settings.GROQ_API_KEY_3,
+            settings.GROQ_API_KEY_4,
+            settings.GROQ_API_KEY_5,
+        ] if k and k.strip()
+    ]
+    GROQ_MODEL_CASCADE = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "qwen/qwen3-32b",
+    ]
+    groq_last_error = ""
+
+    # ── SUMMARY PATH: Map-Reduce over ALL chunks ─────────────────────────────
+    # For summary/overview queries, instead of retrieving top-N chunks,
+    # we read ALL chunks for the document(s), split into batches,
+    # summarize each batch, then combine into a final summary.
+    # This covers 100% of the document instead of ~2%.
+    if is_broad_query and not is_toc_query:
+        print(f"[Chat] Summary query detected — using Map-Reduce over {len(chunks_res)} chunks")
+
+        # Group chunks by document, sorted by chunk_index for reading order
+        from collections import defaultdict
+        doc_chunks_map: dict = defaultdict(list)
+        for chunk in chunks_res:
+            payload = chunk.payload if chunk.payload else {}
+            doc_id = payload.get("document_id", "unknown")
+            chunk_idx = payload.get("chunk_index", 0)
+            text = payload.get("text", "")
+            doc_chunks_map[doc_id].append((chunk_idx, text))
+
+        # Sort each doc's chunks by index (reading order)
+        for doc_id in doc_chunks_map:
+            doc_chunks_map[doc_id].sort(key=lambda x: x[0])
+
+        # Resolve doc_id -> file_name
+        doc_name_map = {}
+        for doc_id in doc_chunks_map:
+            if doc_id in doc_cache:
+                doc_name_map[doc_id] = doc_cache[doc_id]
+            else:
+                try:
+                    doc_uuid = uuid.UUID(doc_id)
+                    doc_stmt = select(Document).where(Document.id == doc_uuid)
+                    doc_res = await db.execute(doc_stmt)
+                    doc_model = doc_res.scalars().first()
+                    if doc_model:
+                        doc_name_map[doc_id] = doc_model.title
+                        doc_cache[doc_id] = doc_model.title
+                    else:
+                        doc_name_map[doc_id] = "Unknown Document"
+                except Exception:
+                    doc_name_map[doc_id] = "Unknown Document"
+
+        # MAP phase: summarize each document in batches
+        # Cap at MAX_MAP_BATCHES to keep total response time under ~60 seconds.
+        # Chunks are evenly sampled across the full document to maintain
+        # coverage of all sections (start, middle, end) not just top chunks.
+        MAX_MAP_BATCHES = 15  # 15 batches x ~2s each = ~30s map phase
+        BATCH_CHARS = 6000
+        partial_summaries = []
+
+        map_system = (
+            "You are a document analysis assistant. "
+            "Read the following excerpt and extract key information: "
+            "main topics, important facts, key figures, conclusions, notable details. "
+            "Be concise but thorough. Output only extracted information, no preamble."
+        )
+
+        for doc_id, indexed_chunks in doc_chunks_map.items():
+            file_name = doc_name_map.get(doc_id, "Document")
+            all_text = "\n\n".join(text for _, text in indexed_chunks)
+            total_chars = len(all_text)
+
+            # Split full text into batches
+            all_batches = [all_text[i:i + BATCH_CHARS] for i in range(0, total_chars, BATCH_CHARS)]
+            total_batches = len(all_batches)
+
+            # Evenly sample up to MAX_MAP_BATCHES from across the document
+            if total_batches <= MAX_MAP_BATCHES:
+                sampled_batches = list(enumerate(all_batches))
+            else:
+                step = total_batches / MAX_MAP_BATCHES
+                sampled_indices = [int(i * step) for i in range(MAX_MAP_BATCHES)]
+                sampled_batches = [(i, all_batches[i]) for i in sampled_indices]
+
+            print(f"[Chat] Map phase: '{file_name}' — {len(indexed_chunks)} chunks, {total_chars} chars, {len(sampled_batches)}/{total_batches} batches")
+
+            doc_partial_summaries = []
+            for batch_num, (original_idx, batch_text) in enumerate(sampled_batches):
+                batch_summary = ""
+                position_pct = int((original_idx / max(total_batches - 1, 1)) * 100)
+                map_user = f"Document: {file_name} (Section ~{position_pct}% through document)\n\n{batch_text}"
+
+                for model_name in GROQ_MODEL_CASCADE:
+                    if batch_summary:
+                        break
+                    for groq_key in groq_keys:
+                        try:
+                            groq_client_map = Groq(api_key=groq_key)
+                            resp = groq_client_map.chat.completions.create(
+                                messages=[
+                                    {"role": "system", "content": map_system},
+                                    {"role": "user", "content": map_user}
+                                ],
+                                model=model_name,
+                                temperature=0.1,
+                                max_tokens=400,
+                            )
+                            batch_summary = resp.choices[0].message.content
+                            print(f"[Chat] Batch {batch_num+1}/{len(sampled_batches)} done")
+                            break
+                        except Exception as e:
+                            err_str = str(e)
+                            if "rate_limit_exceeded" in err_str or "429" in err_str:
+                                continue
+                            else:
+                                break
+
+                if batch_summary:
+                    doc_partial_summaries.append(batch_summary)
+                else:
+                    doc_partial_summaries.append(batch_text[:300] + "...")
+
+            if doc_partial_summaries:
+                partial_summaries.append(
+                    f"### Document: {file_name}\n" + "\n\n".join(doc_partial_summaries)
+                )
+
+        # REDUCE phase: combine all partial summaries into final answer
+        if partial_summaries:
+            combined = "\n\n".join(partial_summaries)
+            # Trim combined to fit within token budget for reduce step
+            MAX_REDUCE_CHARS = 16000
+            if len(combined) > MAX_REDUCE_CHARS:
+                combined = combined[:MAX_REDUCE_CHARS] + "\n\n[Partial summaries trimmed]"
+
+            reduce_system = (
+                "You are an expert research assistant. "
+                "You have been given partial summaries of one or more documents. "
+                "Synthesize them into a single, comprehensive, well-structured final summary.\n\n"
+                "Use this structure (include only sections that have relevant content):\n"
+                "## Overview\n"
+                "## Key Topics Covered\n"
+                "## Executive Summary\n"
+                "## Key Findings / Important Insights\n"
+                "## Important Metrics / Numbers (if applicable)\n"
+                "## Section-wise Summary (if document is large)\n"
+                "## People / Organizations / Technologies Mentioned\n"
+                "## Conclusion\n\n"
+                "Use markdown formatting. Be specific — use actual names, numbers, and facts from the summaries. "
+                "Do not hallucinate. If information is not in the summaries, do not include it."
+            )
+            reduce_user = (
+                f"Partial summaries from notebook '{notebook_name}':\n\n{combined}\n\n"
+                f"User request: {request.message}"
+            )
+
+            llm_response = ""
+            for model_name in GROQ_MODEL_CASCADE:
+                if llm_response:
+                    break
+                for groq_key in groq_keys:
+                    try:
+                        groq_client_reduce = Groq(api_key=groq_key)
+                        completion = groq_client_reduce.chat.completions.create(
+                            messages=[
+                                {"role": "system", "content": reduce_system},
+                                {"role": "user", "content": reduce_user}
+                            ],
+                            model=model_name,
+                            temperature=0.2,
+                            max_tokens=2048,
+                        )
+                        llm_response = completion.choices[0].message.content
+                        key_index = groq_keys.index(groq_key) + 1
+                        print(f"[Chat] Reduce phase done using Groq key #{key_index}, model: {model_name}")
+                        break
+                    except Exception as groq_err:
+                        err_str = str(groq_err)
+                        groq_last_error = err_str
+                        if "rate_limit_exceeded" in err_str or "429" in err_str:
+                            continue
+                        else:
+                            break
+
+            if llm_response:
+                # Build citations from all chunks (first 10 for display)
+                for idx, (hit, score) in enumerate(final_hits[:10]):
+                    payload = hit.payload if hit.payload else {}
+                    doc_id = payload.get("document_id")
+                    chunk_text = payload.get("text", "")
+                    file_name = doc_name_map.get(doc_id, "Source Document")
+                    citations_list.append(Citation(
+                        document_id=doc_id or "",
+                        file_name=file_name,
+                        text=chunk_text,
+                        score=float(score)
+                    ))
+                return ChatResponse(response=llm_response, citations=citations_list)
+
+    # ── NON-SUMMARY PATH: standard RAG (specific questions, TOC, etc.) ─────────
     system_prompt = (
         "You are a helpful AI research assistant inside OpenNotebookLM.\n"
         f"The user is asking questions about documents in a notebook named '{notebook_name}'.\n\n"
@@ -367,10 +572,40 @@ async def chat_with_notebook(
         "3. EXPLAIN / DEFINE (e.g. 'what is X', 'explain X', 'how does X work'):\n"
         "   Give a clear direct explanation. Use bullets if listing multiple aspects.\n\n"
         "4. SUMMARY / OVERVIEW (e.g. 'summarize', 'what is this about', 'overview'):\n"
-        "   Write a structured summary. Include only sections that have actual content:\n"
-        "   ## Overview\n"
-        "   ## Key Topics\n"
-        "   ## Notable Details\n"
+        "   Write a structured summary \n"
+        """Follow this exact structure whenever applicable:
+
+
+
+2. Document Overview
+- Provide a short 2–5 line overview explaining what the document is about.
+
+3. Key Topics Covered
+- List the major topics, concepts, or sections discussed in the document using bullet points.
+
+4. Executive Summary
+- Generate a concise but information-dense summary covering the core ideas, objectives, and conclusions of the document.
+
+5. Important Insights / Key Findings
+- Extract the most meaningful insights, discoveries, arguments, or conclusions.
+- Use numbered bullet points.
+
+
+7. Important Metrics / Numbers (if applicable)
+- Extract statistics, percentages, benchmarks, measurements, financial figures, dates, or performance metrics.
+
+8. Section-wise Summary (if the document is large)
+- Summarize major sections individually.
+
+9. Conclusion
+- Provide a final concise conclusion about the overall purpose and outcome of the document.
+
+10. Citations / References
+- When possible, include page numbers, section references, timestamps, or source references for important claims.
+
+11. Entities and Concepts
+- Extract important people, organizations, technologies, products, research areas, or concepts mentioned in the document.\n"""
+
         "   For chat/support logs also add: ## People Involved, ## Common Issues\n"
         "   Use bullet points. Be specific with names, dates, numbers from context.\n\n"
         "5. COMPARISON (e.g. 'compare X and Y', 'difference between X and Y'):\n"
@@ -384,6 +619,22 @@ async def chat_with_notebook(
         "- Cite sources inline with [1], [2] when quoting or paraphrasing.\n"
         "- Use Markdown (bold, bullets, headers) only when it improves clarity.\n"
         "- Keep the response proportional to what was asked.\n"
+
+        """Behavior Rules:
+- Maintain clarity and readability.
+- Use markdown formatting.
+- Prefer concise but high-information responses.
+- Avoid hallucinating missing information.
+- Clearly state when information is not available in the document.
+- Preserve factual accuracy.
+- If the document is technical, explain difficult concepts in simpler terms while preserving correctness.
+- If the document is very large, prioritize the most important and actionable information.
+- If the user asks for a short summary, provide:
+  - TL;DR
+  - Key insights
+  - Final conclusion only.
+- If the user asks for a detailed summary, include all sections.
+- Always maintain professional formatting suitable for research assistants like NotebookLM or enterprise AI knowledge systems.\n"""
     )
 
     user_content = (
@@ -410,30 +661,14 @@ async def chat_with_notebook(
         f"User Question: {request.message}"
     )
 
-    # 13. Groq key pool + model cascade
+    # 13. Groq key pool + model cascade (used for non-summary RAG path)
     # Strategy:
     #   Round 1: try llama-3.3-70b across ALL 5 keys
     #   Round 2: try llama-3.1-8b across ALL 5 keys
-    #   Round 3: try llama3-8b-8192 across ALL 5 keys
+    #   Round 3: try qwen/qwen3-32b across ALL 5 keys
     #   All exhausted → Ollama fallback
-    groq_keys = [
-        k for k in [
-            settings.GROQ_API_KEY,
-            settings.GROQ_API_KEY_2,
-            settings.GROQ_API_KEY_3,
-            settings.GROQ_API_KEY_4,
-            settings.GROQ_API_KEY_5,
-        ] if k and k.strip()
-    ]
-
-    GROQ_MODEL_CASCADE = [
-        "llama-3.3-70b-versatile",   # best quality, TPD 100k, TPM 6k
-        "llama-3.1-8b-instant",      # fast fallback, TPD 500k, TPM 20k
-        "qwen/qwen3-32b",            # third option (replaces decommissioned llama3-8b-8192)
-    ]
 
     llm_response = ""
-    groq_last_error = ""
 
     # Outer loop: model first, then keys
     # So all keys are tried with model A before falling back to model B
