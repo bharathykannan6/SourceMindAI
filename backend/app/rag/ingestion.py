@@ -28,8 +28,10 @@ except ImportError:
 
 # ── Load model ONCE at startup, reuse across all threads ─────────────────────
 print("[Ingestion] Loading embedding model... (one-time startup cost)")
-embed_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+embed_model = SentenceTransformer("BAAI/bge-base-en-v1.5")
 print("[Ingestion] Embedding model loaded.")
+
+EMBED_DIM = 768  # bge-base output dimension
 
 qdrant_client = QdrantClient(
     host=settings.QDRANT_HOST,
@@ -83,13 +85,28 @@ def update_document_status_sync(document_id: str, new_status: str, error_message
 
 
 def init_qdrant():
-    """Ensure the Qdrant collection exists."""
+    """Ensure the Qdrant collection exists with correct vector dimensions."""
     collections = qdrant_client.get_collections().collections
-    if not any(c.name == VECTOR_COLLECTION for c in collections):
+    existing = next((c for c in collections if c.name == VECTOR_COLLECTION), None)
+
+    if existing:
+        # Check if existing collection has wrong dimensions — happens after model upgrade
+        info = qdrant_client.get_collection(VECTOR_COLLECTION)
+        current_size = info.config.params.vectors.size
+        if current_size != EMBED_DIM:
+            print(f"[Qdrant] Collection has wrong vector size ({current_size} != {EMBED_DIM}). Recreating...")
+            qdrant_client.delete_collection(VECTOR_COLLECTION)
+            qdrant_client.create_collection(
+                collection_name=VECTOR_COLLECTION,
+                vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+            )
+            print(f"[Qdrant] Collection recreated with size={EMBED_DIM}")
+    else:
         qdrant_client.create_collection(
             collection_name=VECTOR_COLLECTION,
-            vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+            vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
         )
+        print(f"[Qdrant] Collection created with size={EMBED_DIM}")
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:

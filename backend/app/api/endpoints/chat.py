@@ -17,8 +17,18 @@ from app.schemas.chat import ChatRequest, ChatResponse, Citation
 from app.core.config import settings
 from app.rag.ingestion import embed_model, qdrant_client, VECTOR_COLLECTION
 from qdrant_client.models import Filter, FieldCondition, MatchValue
+from sentence_transformers import CrossEncoder
 
 router = APIRouter()
+
+# Load reranker once at startup
+print("[Chat] Loading reranker model...")
+try:
+    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    print("[Chat] Reranker loaded.")
+except Exception as e:
+    print(f"[Chat] Reranker failed to load: {e}. Reranking disabled.")
+    reranker = None
 
 # English stop words for fast keyword tokenization in BM25
 STOP_WORDS = {
@@ -242,6 +252,30 @@ async def chat_with_notebook(
         
     # Sort by descending RRF score
     sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+
+    # ── Reranker: re-score top RRF candidates against the query ──────────────
+    # Take top 30 from RRF, rerank them, then use top max_context_chunks
+    rerank_candidates = sorted_rrf[:30]
+    if reranker and rerank_candidates:
+        try:
+            candidate_texts = [
+                point_map[p_id].payload.get("text", "") if point_map[p_id].payload else ""
+                for p_id, _ in rerank_candidates
+            ]
+            pairs = [(request.message, text) for text in candidate_texts]
+            rerank_scores = reranker.predict(pairs)
+            # Merge rerank scores back
+            reranked = sorted(
+                zip([p_id for p_id, _ in rerank_candidates], rerank_scores),
+                key=lambda x: x[1],
+                reverse=True
+            )
+            # Replace sorted_rrf top-30 with reranked order
+            remaining = sorted_rrf[30:]  # keep the rest as-is
+            sorted_rrf = [(p_id, float(score)) for p_id, score in reranked] + remaining
+            print(f"[Reranker] Reranked {len(rerank_candidates)} candidates")
+        except Exception as rerank_err:
+            print(f"[Reranker] Error: {rerank_err} — skipping reranking")
     
     # 6. Construct context and citations list
     context_str = ""
@@ -413,24 +447,68 @@ async def chat_with_notebook(
     if not llm_response and settings.OLLAMA_BASE_URL:
         try:
             async with httpx.AsyncClient() as client:
+                # First check what models are available
+                models_res = await client.get(
+                    f"{settings.OLLAMA_BASE_URL}/api/tags",
+                    timeout=5.0
+                )
+                available_model = "llama3.1:8b"  # default
+                if models_res.status_code == 200:
+                    models = models_res.json().get("models", [])
+                    model_names = [m.get("name", "") for m in models]
+                    print(f"[Ollama] Available models: {model_names}")
+                    preferred = ["llama3.1:8b", "llama3.1", "llama3:latest", "llama3", "mistral", "phi3"]
+                    matched = next((p for p in preferred if p in model_names), None)
+                    if matched:
+                        available_model = matched
+                    elif model_names:
+                        available_model = model_names[0]
+
+                print(f"[Ollama] Using model: {available_model}")
+
+                # Trim context for Ollama — local models have limited context on CPU
+                # Use only top 3 citations, 300 chars each to keep prompt small
+                ollama_citations = citations_list[:3]
+                ollama_context = ""
+                for idx, c in enumerate(ollama_citations):
+                    ollama_context += f"[{idx+1}] {c.file_name}:\n{c.text[:300]}\n\n"
+
+                # Use a SHORT system prompt for Ollama — the full one is too large for CPU inference
+                ollama_system = (
+                    "You are a helpful assistant. Answer the user's question using ONLY the source context below. "
+                    "Be concise and direct. If the answer is not in the context, say so."
+                )
+
+                ollama_user_content = (
+                    f"Source Context:\n{ollama_context or 'No sources available.'}\n"
+                    f"Question: {request.message}"
+                )
+
+                print(f"[Ollama] Prompt size: system={len(ollama_system)} chars, user={len(ollama_user_content)} chars")
+
                 ollama_res = await client.post(
                     f"{settings.OLLAMA_BASE_URL}/api/chat",
                     json={
-                        "model": "llama3",
+                        "model": available_model,
                         "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_content}
+                            {"role": "system", "content": ollama_system},
+                            {"role": "user", "content": ollama_user_content}
                         ],
-                        "options": {"temperature": 0.3},
+                        "options": {"temperature": 0.3, "num_predict": 512},
                         "stream": False
                     },
-                    timeout=30.0
+                    timeout=300.0
                 )
                 if ollama_res.status_code == 200:
                     ollama_json = ollama_res.json()
                     llm_response = ollama_json.get("message", {}).get("content", "")
+                    print(f"[Ollama] Response received successfully")
+                else:
+                    print(f"[Ollama] Error status: {ollama_res.status_code} - {ollama_res.text}")
         except Exception as ollama_err:
-            print(f"Ollama API error: {ollama_err}")
+            import traceback
+            print(f"[Ollama] API error: {type(ollama_err).__name__}: {ollama_err}")
+            print(f"[Ollama] Traceback: {traceback.format_exc()}")
 
     # Final backup if everything is down or empty
     if not llm_response:

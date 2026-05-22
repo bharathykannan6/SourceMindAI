@@ -233,6 +233,10 @@ async def delete_document(
         try:
             from app.rag.ingestion import qdrant_client, VECTOR_COLLECTION
             from qdrant_client.models import Filter, FieldCondition, MatchValue
+            # Check collection exists before attempting delete
+            collections = qdrant_client.get_collections().collections
+            if not any(c.name == VECTOR_COLLECTION for c in collections):
+                return  # nothing to delete
             qdrant_client.delete(
                 collection_name=VECTOR_COLLECTION,
                 points_selector=Filter(
