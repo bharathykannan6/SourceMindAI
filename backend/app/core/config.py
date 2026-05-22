@@ -42,7 +42,11 @@ class Settings(BaseSettings):
     MINIO_ROOT_PASSWORD: str
     MINIO_SECURE: bool = False
     
-    GROQ_API_KEY: str
+    GROQ_API_KEY: str = ""
+    GROQ_API_KEY_2: str = ""
+    GROQ_API_KEY_3: str = ""
+    GROQ_API_KEY_4: str = ""
+    GROQ_API_KEY_5: str = ""
     OLLAMA_BASE_URL: str
     
     model_config = SettingsConfigDict(

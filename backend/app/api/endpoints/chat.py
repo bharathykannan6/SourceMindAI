@@ -30,7 +30,6 @@ except Exception as e:
     print(f"[Chat] Reranker failed to load: {e}. Reranking disabled.")
     reranker = None
 
-# English stop words for fast keyword tokenization in BM25
 STOP_WORDS = {
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "aren't", "as", "at",
     "be", "because", "been", "before", "being", "below", "between", "both", "but", "by", "can't", "cannot", "could",
@@ -49,31 +48,24 @@ STOP_WORDS = {
 }
 
 def tokenize(text: str) -> List[str]:
-    """Tokenize text by lowercasing, extracting alphanumeric words, and filtering out stopwords."""
     words = re.findall(r'\b\w+\b', text.lower())
     return [w for w in words if w not in STOP_WORDS]
 
 def check_toc_similarity(text: str) -> float:
-    """Helper to detect if a text chunk is part of a Table of Contents (TOC)."""
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     if not lines:
         return 0.0
-    
     toc_lines_count = 0
     for line in lines:
-        # Ends with a page number (1-3 digits) optionally followed by some punctuation
         if re.search(r'\s\d{1,3}$', line):
             toc_lines_count += 1
             continue
-        # Starts with digits followed by dot/space
         if re.match(r'^\d+[\.\s]', line):
             toc_lines_count += 1
             continue
-        # Contains dot leaders
         if "..." in line or "···" in line or ". ." in line:
             toc_lines_count += 1
             continue
-            
     return toc_lines_count / len(lines)
 
 
@@ -108,39 +100,25 @@ async def chat_with_notebook(
             detail=f"Embedding generation error: {str(e)}"
         )
 
-    # 3. Retrieve all chunks belonging to this notebook from Qdrant for BM25 Scoring
-    # If specific document_ids are provided, filter to those only
+    # 3. Build Qdrant filter
     notebook_filter_conditions = [
-        FieldCondition(
-            key="notebook_id",
-            match=MatchValue(value=str(request.notebook_id))
-        )
+        FieldCondition(key="notebook_id", match=MatchValue(value=str(request.notebook_id)))
     ]
-
-    # Add document_id filter if specific docs are selected
     selected_doc_ids = request.document_ids or []
     if selected_doc_ids:
         from qdrant_client.models import Filter as QFilter, MatchAny
         doc_filter = Filter(
             must=[
-                FieldCondition(
-                    key="notebook_id",
-                    match=MatchValue(value=str(request.notebook_id))
-                ),
-                FieldCondition(
-                    key="document_id",
-                    match=MatchAny(any=selected_doc_ids)
-                )
+                FieldCondition(key="notebook_id", match=MatchValue(value=str(request.notebook_id))),
+                FieldCondition(key="document_id", match=MatchAny(any=selected_doc_ids))
             ]
         )
     else:
         doc_filter = Filter(must=notebook_filter_conditions)
 
+    # 4. Scroll chunks for BM25 (capped at 3000)
     chunks_res = []
     try:
-        # Cap at 3000 chunks per scroll to prevent OOM / oversized response.
-        # For notebooks with more chunks, BM25 runs on the first 3000 only;
-        # dense semantic search (below) still covers the full collection via HNSW index.
         all_chunks = []
         next_offset = None
         SCROLL_BATCH = 500
@@ -158,70 +136,61 @@ async def chat_with_notebook(
                 break
         chunks_res = all_chunks
     except Exception as scroll_err:
-        print(f"Qdrant scroll error (payloads search fallback): {scroll_err}")
+        print(f"Qdrant scroll error: {scroll_err}")
 
-    # Build dynamic inverted index and calculate BM25 scores
+    # 5. BM25 scoring
     sorted_bm25 = []
     doc_count = len(chunks_res)
     if doc_count > 0:
         chunk_lengths = []
-        inverted_index = {} # term -> list of (chunk_idx, term_frequency)
-        
+        inverted_index = {}
         for idx, chunk in enumerate(chunks_res):
             text_content = chunk.payload.get("text", "") if chunk.payload else ""
             tokens = tokenize(text_content)
             chunk_lengths.append(len(tokens))
-            
-            # Compute term frequencies
             freqs = {}
             for t in tokens:
                 freqs[t] = freqs.get(t, 0) + 1
-                
-            # Populate inverted index
             for term, freq in freqs.items():
                 if term not in inverted_index:
                     inverted_index[term] = []
                 inverted_index[term].append((idx, freq))
-        
         avgdl = sum(chunk_lengths) / doc_count if doc_count > 0 else 0
-        
-        # Score query terms against candidate chunks containing them
         query_terms = tokenize(request.message)
-        bm25_scores = {} # chunk_idx -> float score
+        bm25_scores = {}
         k1 = 1.2
         b = 0.75
-        
         for term in query_terms:
             if term in inverted_index:
                 postings = inverted_index[term]
                 n_q = len(postings)
-                
-                # BM25 standard IDF formulation
                 idf = math.log(1.0 + (doc_count - n_q + 0.5) / (n_q + 0.5))
-                
                 for chunk_idx, tf in postings:
                     doc_len = chunk_lengths[chunk_idx]
                     denom = tf + k1 * (1.0 - b + b * (doc_len / avgdl if avgdl > 0 else 1.0))
                     num = tf * (k1 + 1.0)
                     term_score = idf * (num / denom)
                     bm25_scores[chunk_idx] = bm25_scores.get(chunk_idx, 0.0) + term_score
-                    
         sorted_bm25 = sorted(bm25_scores.items(), key=lambda x: x[1], reverse=True)
 
-    # Detect query type to adjust retrieval depth
+    # 6. Detect query type
     query_lower = request.message.lower()
-    is_toc_query = any(term in query_lower for term in ["table of content", "table of contents", "toc", "index of", "chapters", "list the contents"])
+    is_toc_query = any(term in query_lower for term in [
+        "table of content", "table of contents", "toc", "index of", "chapters", "list the contents"
+    ])
     is_broad_query = any(term in query_lower for term in [
         "summarize", "summary", "overview", "explain", "describe", "tell me about",
         "what is", "what are", "journey", "history", "all", "entire", "whole",
-        "everything", "comprehensive", "detailed", "full"
+        "everything", "comprehensive", "detailed", "full",
+        "about", "topics", "themes", "issues", "problems", "common", "main",
+        "key", "important", "agents", "users", "conversations", "discuss",
+        "cover", "contains", "file", "document", "report"
     ])
 
-    # Scale retrieval depth to query type
-    dense_limit = 30 if (is_broad_query or is_toc_query) else 15
-    max_context_chunks = 40 if is_toc_query else (30 if is_broad_query else 15)
+    dense_limit = 60 if (is_broad_query or is_toc_query) else 20
+    max_context_chunks = 60 if is_toc_query else (50 if is_broad_query else 20)
 
-    # 4. Retrieve dense semantic search results from Qdrant
+    # 7. Dense semantic search
     dense_results = []
     try:
         dense_results = qdrant_client.search(
@@ -233,28 +202,21 @@ async def chat_with_notebook(
     except Exception as e:
         print(f"Qdrant dense search error: {e}")
 
-    # 5. Fuse dense and sparse results using Reciprocal Rank Fusion (RRF)
-    rrf_scores = {} # point_id -> float score
-    point_map = {}  # point_id -> Point/Record object
-    
-    # Add dense ranks to RRF
+    # 8. RRF fusion
+    rrf_scores = {}
+    point_map = {}
     for rank, hit in enumerate(dense_results):
         p_id = str(hit.id)
         point_map[p_id] = hit
         rrf_scores[p_id] = rrf_scores.get(p_id, 0.0) + 1.0 / (60.0 + (rank + 1))
-        
-    # Add sparse BM25 ranks to RRF (limiting to top 60 candidates)
     for rank, (chunk_idx, score) in enumerate(sorted_bm25[:60]):
         chunk = chunks_res[chunk_idx]
         p_id = str(chunk.id)
         point_map[p_id] = chunk
         rrf_scores[p_id] = rrf_scores.get(p_id, 0.0) + 1.0 / (60.0 + (rank + 1))
-        
-    # Sort by descending RRF score
     sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
-    # ── Reranker: re-score top RRF candidates against the query ──────────────
-    # Take top 30 from RRF, rerank them, then use top max_context_chunks
+    # 9. Reranker
     rerank_candidates = sorted_rrf[:30]
     if reranker and rerank_candidates:
         try:
@@ -264,31 +226,26 @@ async def chat_with_notebook(
             ]
             pairs = [(request.message, text) for text in candidate_texts]
             rerank_scores = reranker.predict(pairs)
-            # Merge rerank scores back
             reranked = sorted(
                 zip([p_id for p_id, _ in rerank_candidates], rerank_scores),
-                key=lambda x: x[1],
-                reverse=True
+                key=lambda x: x[1], reverse=True
             )
-            # Replace sorted_rrf top-30 with reranked order
-            remaining = sorted_rrf[30:]  # keep the rest as-is
+            remaining = sorted_rrf[30:]
             sorted_rrf = [(p_id, float(score)) for p_id, score in reranked] + remaining
             print(f"[Reranker] Reranked {len(rerank_candidates)} candidates")
         except Exception as rerank_err:
             print(f"[Reranker] Error: {rerank_err} — skipping reranking")
-    
-    # 6. Construct context and citations list
+
+    # 10. Build context and citations
     context_str = ""
     citations_list: List[Citation] = []
     doc_cache = {}
-
     final_hits = []
     seen_chunk_keys = set()
 
-    # If it's a TOC query, let's proactively identify and group TOC chunks by document
+    # TOC chunk prepending
     toc_chunks_to_prepend = []
     if is_toc_query and doc_count > 0:
-        # Find doc_ids that appear in the top search hits to ensure we only retrieve TOC for relevant documents
         candidate_doc_ids = set()
         for p_id, _ in sorted_rrf[:15]:
             hit = point_map[p_id]
@@ -296,22 +253,16 @@ async def chat_with_notebook(
             doc_id = payload.get("document_id")
             if doc_id:
                 candidate_doc_ids.add(str(doc_id))
-
         for doc_id_str in candidate_doc_ids:
-            # Find all chunks for this document
             doc_chunks = [c for c in chunks_res if c.payload and str(c.payload.get("document_id")) == doc_id_str]
-            # Find the starting TOC chunk
             start_chunk = None
             for chunk in doc_chunks:
                 payload = chunk.payload
                 text_lower = payload.get("text", "").lower()
-                # Check if this chunk is a likely start of the TOC
                 if "table of contents" in text_lower or "contents" in text_lower or "index" in text_lower:
                     if check_toc_similarity(payload.get("text", "")) > 0.4:
                         start_chunk = chunk
                         break
-            
-            # If we didn't find one with score > 0.4, try any chunk with the TOC keyword in the top hits
             if not start_chunk:
                 for p_id, _ in sorted_rrf[:15]:
                     hit = point_map[p_id]
@@ -321,14 +272,11 @@ async def chat_with_notebook(
                         if "table of contents" in text_lower or "contents" in text_lower or "index" in text_lower:
                             start_chunk = hit
                             break
-            
             if start_chunk:
                 start_idx = start_chunk.payload.get("chunk_index", 0)
-                # Fetch subsequent chunks sequentially as long as they look like TOC
                 toc_chunks_to_prepend.append(start_chunk)
                 current_idx = start_idx + 1
-                max_toc_expansion = 15 # safety limit
-                for _ in range(max_toc_expansion):
+                for _ in range(15):
                     next_chunk = next((c for c in doc_chunks if c.payload.get("chunk_index") == current_idx), None)
                     if next_chunk:
                         text = next_chunk.payload.get("text", "")
@@ -336,7 +284,6 @@ async def chat_with_notebook(
                             toc_chunks_to_prepend.append(next_chunk)
                             current_idx += 1
                         else:
-                            # Let's check one more chunk in case of a single transition/page-boundary gap
                             next_next_chunk = next((c for c in doc_chunks if c.payload.get("chunk_index") == current_idx + 1), None)
                             if next_next_chunk and check_toc_similarity(next_next_chunk.payload.get("text", "")) > 0.15:
                                 toc_chunks_to_prepend.append(next_chunk)
@@ -347,9 +294,7 @@ async def chat_with_notebook(
                     else:
                         break
 
-    # Add the identified TOC chunks to final_hits first
-    # We assign them a higher pseudo RRF score to ensure they stay at the front
-    base_toc_score = 0.5 # higher than any normal RRF score
+    base_toc_score = 0.5
     for hit in toc_chunks_to_prepend:
         payload = hit.payload if hit.payload else {}
         doc_id = payload.get("document_id")
@@ -359,30 +304,24 @@ async def chat_with_notebook(
             if chunk_key not in seen_chunk_keys:
                 seen_chunk_keys.add(chunk_key)
                 final_hits.append((hit, base_toc_score))
-                base_toc_score -= 0.001 # slightly degrade to maintain order
+                base_toc_score -= 0.001
 
-    # Add the remaining top RRF search hits
-    for p_id, score in sorted_rrf[:15]:
+    for p_id, score in sorted_rrf[:max_context_chunks]:
         hit = point_map[p_id]
         payload = hit.payload if hit.payload else {}
         doc_id = payload.get("document_id")
         chunk_idx = payload.get("chunk_index")
-
         if doc_id and chunk_idx is not None:
             chunk_key = (doc_id, chunk_idx)
             if chunk_key in seen_chunk_keys:
                 continue
             seen_chunk_keys.add(chunk_key)
-
         final_hits.append((hit, score))
 
-    # Determine how many context chunks to send to the LLM (set dynamically above)
     for idx, (hit, score) in enumerate(final_hits[:max_context_chunks]):
         payload = hit.payload if hit.payload else {}
         doc_id = payload.get("document_id")
         chunk_text = payload.get("text")
-
-        # Get the actual filename/title of the document
         file_name = "Source Document"
         if doc_id:
             if doc_id in doc_cache:
@@ -398,10 +337,8 @@ async def chat_with_notebook(
                         doc_cache[doc_id] = file_name
                 except Exception as db_err:
                     print(f"Error fetching document metadata: {db_err}")
-
         source_num = idx + 1
         context_str += f"Source [{source_num}] (Document: {file_name}):\n{chunk_text}\n\n"
-
         citations_list.append(Citation(
             document_id=doc_id or "",
             file_name=file_name,
@@ -409,55 +346,152 @@ async def chat_with_notebook(
             score=float(score)
         ))
 
-
-    # 5. Synthesize LLM Response
+    # 11. Build system prompt
     system_prompt = (
-        "You are an expert AI research assistant inside OpenNotebookLM.\n"
-        f"You are helping the user with their notebook named '{notebook_name}'.\n\n"
-        "RULES:\n"
-        "1. Answer ONLY using the Source Context chunks provided. Never use outside knowledge.\n"
-        "2. For summary/overview questions: synthesize ALL relevant chunks into a thorough, well-structured response. Group related information into clear sections with headers. Don't just list facts — explain the significance.\n"
-        "3. For specific questions: answer precisely and cite sources with [1], [2] etc.\n"
-        "4. If the context truly doesn't contain the answer, say: \"The uploaded documents don't contain information about '[topic]'. Please upload a relevant document.\"\n"
-        "5. Format in Markdown with headers, bullet points, and bold text where appropriate.\n"
-        "6. Be thorough — a good summary should cover all major themes from the context, not just the first few chunks.\n"
+        "You are a helpful AI research assistant inside OpenNotebookLM.\n"
+        f"The user is asking questions about documents in a notebook named '{notebook_name}'.\n\n"
+        "INSTRUCTIONS:\n"
+        "Answer the user's question directly using ONLY the Source Context provided. "
+        "Never use outside knowledge.\n\n"
+        "FORMAT based on what the user asked:\n\n"
+        "1. LIST REQUEST (e.g. 'list the questions', 'give me the topics', 'what are the steps'):\n"
+        "   Output a clean numbered list. No intro paragraph. No section headers. No commentary.\n"
+        "   Example:\n"
+        "   1. Define data communication\n"
+        "   2. Compare MAC and IP address\n"
+        "   3. Explain error correction\n\n"
+        "2. PERSON / IDENTITY (e.g. 'who is X', 'tell me about X'):\n"
+        "   If found in context: one short paragraph with name, role, and details.\n"
+        "   If NOT found: reply ONLY with 'There is no mention of [X] in the uploaded documents.' Then stop.\n"
+        "   Important: search carefully including partial name matches before saying not found.\n\n"
+        "3. EXPLAIN / DEFINE (e.g. 'what is X', 'explain X', 'how does X work'):\n"
+        "   Give a clear direct explanation. Use bullets if listing multiple aspects.\n\n"
+        "4. SUMMARY / OVERVIEW (e.g. 'summarize', 'what is this about', 'overview'):\n"
+        "   Write a structured summary. Include only sections that have actual content:\n"
+        "   ## Overview\n"
+        "   ## Key Topics\n"
+        "   ## Notable Details\n"
+        "   For chat/support logs also add: ## People Involved, ## Common Issues\n"
+        "   Use bullet points. Be specific with names, dates, numbers from context.\n\n"
+        "5. COMPARISON (e.g. 'compare X and Y', 'difference between X and Y'):\n"
+        "   Use clear bullet points per item or side-by-side structure.\n\n"
+        "6. ANY OTHER QUESTION:\n"
+        "   Answer directly and concisely using only the Source Context.\n"
+        "   If not found: 'The uploaded documents do not contain information about [topic].'\n\n"
+        "ALWAYS:\n"
+        "- Never add sections or content the user did not ask for.\n"
+        "- Never pad the response with unrelated content.\n"
+        "- Cite sources inline with [1], [2] when quoting or paraphrasing.\n"
+        "- Use Markdown (bold, bullets, headers) only when it improves clarity.\n"
+        "- Keep the response proportional to what was asked.\n"
     )
 
-    user_content = f"Source Context:\n{context_str or 'No sources available in this notebook.'}\n\nUser Query: {request.message}"
+    user_content = (
+        f"Source Context:\n{context_str or 'No sources available in this notebook.'}\n\n"
+        f"User Question: {request.message}"
+    )
+
+    # 12. Token budget
+    # TPM limits per model: llama-3.3-70b = 6k TPM, llama-3.1-8b = 20k TPM
+    # Keep total prompt (context + system + question) under 5000 tokens
+    # to avoid hitting TPM limit across all keys simultaneously.
+    # 1 token ~ 4 chars, so 5000 tokens ~ 20000 chars of context
+    MAX_CONTEXT_CHARS = 18000 if (is_broad_query or is_toc_query) else 8000
+    output_tokens = 2048 if (is_broad_query or is_toc_query) else 1024
+
+    # Trim context_str to stay within token budget
+    if len(context_str) > MAX_CONTEXT_CHARS:
+        context_str = context_str[:MAX_CONTEXT_CHARS] + "\n\n[Context trimmed to fit token limit]"
+        print(f"[Chat] Context trimmed to {MAX_CONTEXT_CHARS} chars to stay within TPM limit")
+
+    # Rebuild user_content after trimming
+    user_content = (
+        f"Source Context:\n{context_str or 'No sources available in this notebook.'}\n\n"
+        f"User Question: {request.message}"
+    )
+
+    # 13. Groq key pool + model cascade
+    # Strategy:
+    #   Round 1: try llama-3.3-70b across ALL 5 keys
+    #   Round 2: try llama-3.1-8b across ALL 5 keys
+    #   Round 3: try llama3-8b-8192 across ALL 5 keys
+    #   All exhausted → Ollama fallback
+    groq_keys = [
+        k for k in [
+            settings.GROQ_API_KEY,
+            settings.GROQ_API_KEY_2,
+            settings.GROQ_API_KEY_3,
+            settings.GROQ_API_KEY_4,
+            settings.GROQ_API_KEY_5,
+        ] if k and k.strip()
+    ]
+
+    GROQ_MODEL_CASCADE = [
+        "llama-3.3-70b-versatile",   # best quality, TPD 100k, TPM 6k
+        "llama-3.1-8b-instant",      # fast fallback, TPD 500k, TPM 20k
+        "qwen/qwen3-32b",            # third option (replaces decommissioned llama3-8b-8192)
+    ]
 
     llm_response = ""
-    # Try Groq first
-    if settings.GROQ_API_KEY:
-        try:
-            client = Groq(api_key=settings.GROQ_API_KEY)
-            completion = client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content}
-                ],
-                model="llama-3.3-70b-versatile",
-                temperature=0.2,
-                max_tokens=2048,
-            )
-            llm_response = completion.choices[0].message.content
-        except Exception as groq_err:
-            print(f"Groq API error: {groq_err}")
+    groq_last_error = ""
 
-    # Fallback to Ollama if Groq fails or is not configured
+    # Outer loop: model first, then keys
+    # So all keys are tried with model A before falling back to model B
+    for model_name in GROQ_MODEL_CASCADE:
+        if llm_response:
+            break
+        for groq_key in groq_keys:
+            try:
+                groq_client = Groq(api_key=groq_key)
+                completion = groq_client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content}
+                    ],
+                    model=model_name,
+                    temperature=0.2,
+                    max_tokens=output_tokens,
+                )
+                llm_response = completion.choices[0].message.content
+                key_index = groq_keys.index(groq_key) + 1
+                print(f"[Chat] Responded using Groq key #{key_index}, model: {model_name}")
+                break  # success — stop trying keys for this model
+            except Exception as groq_err:
+                err_str = str(groq_err)
+                groq_last_error = err_str
+                key_index = groq_keys.index(groq_key) + 1
+                if "rate_limit_exceeded" in err_str or "429" in err_str:
+                    print(f"[Chat] Groq key #{key_index} rate limited on {model_name}, trying next key...")
+                    continue  # try next key with same model
+                else:
+                    print(f"[Chat] Groq key #{key_index} error on {model_name}: {groq_err}")
+                    break  # non-rate-limit error, skip remaining keys for this model
+
+    # 14. Ollama fallback
     if not llm_response and settings.OLLAMA_BASE_URL:
         try:
             async with httpx.AsyncClient() as client:
-                # First check what models are available
                 models_res = await client.get(
                     f"{settings.OLLAMA_BASE_URL}/api/tags",
                     timeout=5.0
                 )
-                available_model = "llama3.1:8b"  # default
+                available_model = "llama3.1:8b"
                 if models_res.status_code == 200:
                     models = models_res.json().get("models", [])
                     model_names = [m.get("name", "") for m in models]
                     print(f"[Ollama] Available models: {model_names}")
-                    preferred = ["llama3.1:8b", "llama3.1", "llama3:latest", "llama3", "mistral", "phi3"]
+                    preferred = [
+                        "llama3.3:70b",    # same model as Groq — best quality
+                        "llama3.1:70b",    # close second
+                        "qwen2.5:32b",     # excellent mid-size
+                        "phi4:14b",        # best small model for RAG
+                        "llama3.1:8b",     # fast fallback
+                        "llama3.1",
+                        "llama3:latest",
+                        "llama3",
+                        "mistral",
+                        "phi3",
+                    ]
                     matched = next((p for p in preferred if p in model_names), None)
                     if matched:
                         available_model = matched
@@ -466,19 +500,17 @@ async def chat_with_notebook(
 
                 print(f"[Ollama] Using model: {available_model}")
 
-                # Trim context for Ollama — local models have limited context on CPU
-                # Use only top 3 citations, 300 chars each to keep prompt small
+                # Short prompt for Ollama — keeps CPU inference fast
                 ollama_citations = citations_list[:3]
                 ollama_context = ""
-                for idx, c in enumerate(ollama_citations):
-                    ollama_context += f"[{idx+1}] {c.file_name}:\n{c.text[:300]}\n\n"
+                for i, c in enumerate(ollama_citations):
+                    ollama_context += f"[{i+1}] {c.file_name}:\n{c.text[:300]}\n\n"
 
-                # Use a SHORT system prompt for Ollama — the full one is too large for CPU inference
                 ollama_system = (
-                    "You are a helpful assistant. Answer the user's question using ONLY the source context below. "
-                    "Be concise and direct. If the answer is not in the context, say so."
+                    "You are a helpful assistant. Answer the user's question using ONLY the source context. "
+                    "Be concise and direct. Format as a numbered list if the user asks for a list. "
+                    "If the answer is not in the context, say so."
                 )
-
                 ollama_user_content = (
                     f"Source Context:\n{ollama_context or 'No sources available.'}\n"
                     f"Question: {request.message}"
@@ -510,20 +542,35 @@ async def chat_with_notebook(
             print(f"[Ollama] API error: {type(ollama_err).__name__}: {ollama_err}")
             print(f"[Ollama] Traceback: {traceback.format_exc()}")
 
-    # Final backup if everything is down or empty
+    # 15. Final fallback
     if not llm_response:
         if not context_str:
             llm_response = (
-                "It looks like there are no documents in this notebook yet, or the database is starting up. "
-                "Please upload a PDF, Word, PowerPoint, Audio file, or Web Link using the 'Drop files or click to add' "
-                "button in the side explorer. Once uploaded, I will automatically index and parse your documents for semantic search!"
+                "It looks like there are no documents in this notebook yet. "
+                "Please upload a PDF, Word, PowerPoint, audio file, or paste text using the panel on the left. "
+                "Once uploaded, I will index and parse your documents for semantic search."
             )
         else:
+            retry_hint = ""
+            if "rate_limit_exceeded" in groq_last_error and "Please try again in" in groq_last_error:
+                try:
+                    retry_hint = " (" + groq_last_error.split("Please try again in ")[1].split(".")[0] + " remaining on Groq free tier)"
+                except Exception:
+                    retry_hint = ""
+
             llm_response = (
-                f"I've found {len(citations_list)} relevant excerpts in your notebook documents, "
-                "but I couldn't reach the AI language generation server to synthesize a full summary. "
-                "Here are the direct source snippets I found:\n\n"
-                + "\n\n".join([f"**From {c.file_name}:**\n> {c.text}" for c in citations_list])
+                f"**AI model temporarily unavailable{retry_hint}.**\n\n"
+                "All configured AI models are either rate-limited or unreachable right now.\n\n"
+                "**What you can do:**\n"
+                "- Wait a few minutes and try again\n"
+                "- Start Ollama locally (`ollama serve`) as a free unlimited fallback\n"
+                "- Upgrade your Groq plan at https://console.groq.com/settings/billing\n\n"
+                "---\n"
+                f"**Retrieved {len(citations_list)} relevant source excerpts** while waiting:\n\n"
+                + "\n\n".join([
+                    f"**[{i+1}] {c.file_name}:**\n> {c.text[:300]}..."
+                    for i, c in enumerate(citations_list[:5])
+                ])
             )
 
     return ChatResponse(
