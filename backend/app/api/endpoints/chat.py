@@ -1,6 +1,7 @@
 import uuid
 import math
 import re
+import threading
 from typing import Any, List, Set, Dict, Tuple
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +17,11 @@ from app.models.document import Document
 from app.schemas.chat import ChatRequest, ChatResponse, Citation
 from app.core.config import settings
 from app.rag.ingestion import embed_model, qdrant_client, VECTOR_COLLECTION
+from app.rag.memory import (
+    load_short_term, save_turn, get_turn_count,
+    load_summary, store_memory_vector, retrieve_memory_vectors,
+    maybe_summarise, SHORT_TERM_TURNS
+)
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 from sentence_transformers import CrossEncoder
 
@@ -90,6 +96,27 @@ async def chat_with_notebook(
         raise HTTPException(status_code=404, detail="Notebook not found")
 
     notebook_name = row[0].name
+    notebook_id_str = str(request.notebook_id)
+    user_id_str = str(current_user.id)
+
+    # ── Memory: resolve or create conversation_id ─────────────────────────────
+    conversation_id = request.conversation_id or str(uuid.uuid4())
+
+    # Layer 1: Short-term memory (last N turns)
+    short_term = await load_short_term(db, notebook_id_str, user_id_str, conversation_id)
+
+    # Layer 2: Summary memory
+    summary_memory = await load_summary(db, notebook_id_str, conversation_id)
+
+    # Layer 3: Vector memory (semantically relevant past exchanges)
+    vector_memories = retrieve_memory_vectors(
+        qdrant_client, embed_model, notebook_id_str, request.message, top_k=3
+    )
+
+    # Save user turn immediately
+    turn_count = await save_turn(
+        db, notebook_id_str, user_id_str, conversation_id, "user", request.message
+    )
 
     # 2. Embed the user's message
     try:
@@ -364,14 +391,9 @@ async def chat_with_notebook(
     groq_last_error = ""
 
     # ── SUMMARY PATH: Map-Reduce over ALL chunks ─────────────────────────────
-    # For summary/overview queries, instead of retrieving top-N chunks,
-    # we read ALL chunks for the document(s), split into batches,
-    # summarize each batch, then combine into a final summary.
-    # This covers 100% of the document instead of ~2%.
     if is_broad_query and not is_toc_query:
         print(f"[Chat] Summary query detected — using Map-Reduce over {len(chunks_res)} chunks")
 
-        # Group chunks by document, sorted by chunk_index for reading order
         from collections import defaultdict
         doc_chunks_map: dict = defaultdict(list)
         for chunk in chunks_res:
@@ -381,11 +403,9 @@ async def chat_with_notebook(
             text = payload.get("text", "")
             doc_chunks_map[doc_id].append((chunk_idx, text))
 
-        # Sort each doc's chunks by index (reading order)
         for doc_id in doc_chunks_map:
             doc_chunks_map[doc_id].sort(key=lambda x: x[0])
 
-        # Resolve doc_id -> file_name
         doc_name_map = {}
         for doc_id in doc_chunks_map:
             if doc_id in doc_cache:
@@ -404,11 +424,7 @@ async def chat_with_notebook(
                 except Exception:
                     doc_name_map[doc_id] = "Unknown Document"
 
-        # MAP phase: summarize each document in batches
-        # Cap at MAX_MAP_BATCHES to keep total response time under ~60 seconds.
-        # Chunks are evenly sampled across the full document to maintain
-        # coverage of all sections (start, middle, end) not just top chunks.
-        MAX_MAP_BATCHES = 15  # 15 batches x ~2s each = ~30s map phase
+        MAX_MAP_BATCHES = 15
         BATCH_CHARS = 6000
         partial_summaries = []
 
@@ -424,11 +440,9 @@ async def chat_with_notebook(
             all_text = "\n\n".join(text for _, text in indexed_chunks)
             total_chars = len(all_text)
 
-            # Split full text into batches
             all_batches = [all_text[i:i + BATCH_CHARS] for i in range(0, total_chars, BATCH_CHARS)]
             total_batches = len(all_batches)
 
-            # Evenly sample up to MAX_MAP_BATCHES from across the document
             if total_batches <= MAX_MAP_BATCHES:
                 sampled_batches = list(enumerate(all_batches))
             else:
@@ -479,10 +493,8 @@ async def chat_with_notebook(
                     f"### Document: {file_name}\n" + "\n\n".join(doc_partial_summaries)
                 )
 
-        # REDUCE phase: combine all partial summaries into final answer
         if partial_summaries:
             combined = "\n\n".join(partial_summaries)
-            # Trim combined to fit within token budget for reduce step
             MAX_REDUCE_CHARS = 16000
             if len(combined) > MAX_REDUCE_CHARS:
                 combined = combined[:MAX_REDUCE_CHARS] + "\n\n[Partial summaries trimmed]"
@@ -491,15 +503,11 @@ async def chat_with_notebook(
                 "You are an expert research assistant. "
                 "You have been given partial summaries of one or more documents. "
                 "Synthesize them into a single, comprehensive, well-structured final summary.\n\n"
-                "Use this structure (include only sections that have relevant content):\n"
-                "## Overview\n"
-                "## Key Topics Covered\n"
-                "## Executive Summary\n"
-                "## Key Findings / Important Insights\n"
-                "## Important Metrics / Numbers (if applicable)\n"
-                "## Section-wise Summary (if document is large)\n"
-                "## People / Organizations / Technologies Mentioned\n"
-                "## Conclusion\n\n"
+                "CITATION RULE — MANDATORY: Every sentence or fact you write MUST end with an inline "
+                "source number like [1], [2], [3] referring to the source document. "
+                "The source numbers correspond to the order the documents were provided. "
+                "Do NOT write any sentence without a citation. "
+                "Do NOT add a references section at the end — only inline [N] markers.\n\n"
                 "Use markdown formatting. Be specific — use actual names, numbers, and facts from the summaries. "
                 "Do not hallucinate. If information is not in the summaries, do not include it."
             )
@@ -537,7 +545,8 @@ async def chat_with_notebook(
                             break
 
             if llm_response:
-                # Build citations from all chunks (first 10 for display)
+                # Rebuild citations from final_hits for the map-reduce path
+                citations_list = []
                 for idx, (hit, score) in enumerate(final_hits[:10]):
                     payload = hit.payload if hit.payload else {}
                     doc_id = payload.get("document_id")
@@ -549,9 +558,41 @@ async def chat_with_notebook(
                         text=chunk_text,
                         score=float(score)
                     ))
-                return ChatResponse(response=llm_response, citations=citations_list)
+
+                # Save assistant turn for memory
+                await save_turn(
+                    db, notebook_id_str, user_id_str, conversation_id, "assistant", llm_response
+                )
+                exchange_text = f"User: {request.message}\nAssistant: {llm_response[:500]}"
+                threading.Thread(
+                    target=store_memory_vector,
+                    args=(qdrant_client, embed_model, notebook_id_str, conversation_id, exchange_text, "turn"),
+                    daemon=True
+                ).start()
+
+                return ChatResponse(
+                    response=llm_response,
+                    citations=citations_list,
+                    conversation_id=conversation_id
+                )
 
     # ── NON-SUMMARY PATH: standard RAG (specific questions, TOC, etc.) ─────────
+    # Build memory context block
+    memory_block = ""
+    if summary_memory:
+        memory_block += f"## Conversation Summary So Far\n{summary_memory}\n\n"
+    if vector_memories:
+        memory_block += "## Relevant Past Context\n"
+        for m in vector_memories:
+            memory_block += f"- {m[:200]}\n"
+        memory_block += "\n"
+    if short_term:
+        memory_block += "## Recent Conversation\n"
+        for turn in short_term:
+            prefix = "User" if turn["role"] == "user" else "Assistant"
+            memory_block += f"{prefix}: {turn['content'][:300]}\n"
+        memory_block += "\n"
+
     system_prompt = (
         "You are a helpful AI research assistant inside OpenNotebookLM.\n"
         f"The user is asking questions about documents in a notebook named '{notebook_name}'.\n\n"
@@ -572,40 +613,7 @@ async def chat_with_notebook(
         "3. EXPLAIN / DEFINE (e.g. 'what is X', 'explain X', 'how does X work'):\n"
         "   Give a clear direct explanation. Use bullets if listing multiple aspects.\n\n"
         "4. SUMMARY / OVERVIEW (e.g. 'summarize', 'what is this about', 'overview'):\n"
-        "   Write a structured summary \n"
-        """Follow this exact structure whenever applicable:
-
-
-
-2. Document Overview
-- Provide a short 2–5 line overview explaining what the document is about.
-
-3. Key Topics Covered
-- List the major topics, concepts, or sections discussed in the document using bullet points.
-
-4. Executive Summary
-- Generate a concise but information-dense summary covering the core ideas, objectives, and conclusions of the document.
-
-5. Important Insights / Key Findings
-- Extract the most meaningful insights, discoveries, arguments, or conclusions.
-- Use numbered bullet points.
-
-
-7. Important Metrics / Numbers (if applicable)
-- Extract statistics, percentages, benchmarks, measurements, financial figures, dates, or performance metrics.
-
-8. Section-wise Summary (if the document is large)
-- Summarize major sections individually.
-
-9. Conclusion
-- Provide a final concise conclusion about the overall purpose and outcome of the document.
-
-10. Citations / References
-- When possible, include page numbers, section references, timestamps, or source references for important claims.
-
-11. Entities and Concepts
-- Extract important people, organizations, technologies, products, research areas, or concepts mentioned in the document.\n"""
-
+        "   Write a structured summary.\n"
         "   For chat/support logs also add: ## People Involved, ## Common Issues\n"
         "   Use bullet points. Be specific with names, dates, numbers from context.\n\n"
         "5. COMPARISON (e.g. 'compare X and Y', 'difference between X and Y'):\n"
@@ -616,62 +624,44 @@ async def chat_with_notebook(
         "ALWAYS:\n"
         "- Never add sections or content the user did not ask for.\n"
         "- Never pad the response with unrelated content.\n"
-        "- Cite sources inline with [1], [2] when quoting or paraphrasing.\n"
+        "- CITATION RULE — MANDATORY: After EVERY sentence place the source number inline like [1] or [2].\n"
+        "  The numbers match Source [1], Source [2] etc. from the context provided above.\n"
+        "  Never write a sentence without a citation marker.\n"
+        "  Never group all citations at the end — place [N] right after each sentence.\n"
+        "  Example: The system supports up to 5 users [1]. New logins are blocked when exceeded [2].\n"
         "- Use Markdown (bold, bullets, headers) only when it improves clarity.\n"
-        "- Keep the response proportional to what was asked.\n"
-
-        """Behavior Rules:
-- Maintain clarity and readability.
-- Use markdown formatting.
-- Prefer concise but high-information responses.
-- Avoid hallucinating missing information.
-- Clearly state when information is not available in the document.
-- Preserve factual accuracy.
-- If the document is technical, explain difficult concepts in simpler terms while preserving correctness.
-- If the document is very large, prioritize the most important and actionable information.
-- If the user asks for a short summary, provide:
-  - TL;DR
-  - Key insights
-  - Final conclusion only.
-- If the user asks for a detailed summary, include all sections.
-- Always maintain professional formatting suitable for research assistants like NotebookLM or enterprise AI knowledge systems.\n"""
+        "- Keep the response proportional to what was asked.\n\n"
+        "Behavior Rules:\n"
+        "- Maintain clarity and readability.\n"
+        "- Prefer concise but high-information responses.\n"
+        "- Avoid hallucinating missing information.\n"
+        "- Clearly state when information is not available in the document.\n"
+        "- Preserve factual accuracy.\n"
+        "- If the document is technical, explain difficult concepts simply while preserving correctness.\n"
+        "- If the document is very large, prioritize the most important and actionable information.\n"
+        "- Always maintain professional formatting suitable for research assistants.\n"
     )
 
     user_content = (
+        f"{memory_block}"
         f"Source Context:\n{context_str or 'No sources available in this notebook.'}\n\n"
         f"User Question: {request.message}"
     )
 
-    # 12. Token budget
-    # TPM limits per model: llama-3.3-70b = 6k TPM, llama-3.1-8b = 20k TPM
-    # Keep total prompt (context + system + question) under 5000 tokens
-    # to avoid hitting TPM limit across all keys simultaneously.
-    # 1 token ~ 4 chars, so 5000 tokens ~ 20000 chars of context
     MAX_CONTEXT_CHARS = 18000 if (is_broad_query or is_toc_query) else 8000
     output_tokens = 2048 if (is_broad_query or is_toc_query) else 1024
 
-    # Trim context_str to stay within token budget
     if len(context_str) > MAX_CONTEXT_CHARS:
         context_str = context_str[:MAX_CONTEXT_CHARS] + "\n\n[Context trimmed to fit token limit]"
         print(f"[Chat] Context trimmed to {MAX_CONTEXT_CHARS} chars to stay within TPM limit")
 
-    # Rebuild user_content after trimming
     user_content = (
         f"Source Context:\n{context_str or 'No sources available in this notebook.'}\n\n"
         f"User Question: {request.message}"
     )
 
-    # 13. Groq key pool + model cascade (used for non-summary RAG path)
-    # Strategy:
-    #   Round 1: try llama-3.3-70b across ALL 5 keys
-    #   Round 2: try llama-3.1-8b across ALL 5 keys
-    #   Round 3: try qwen/qwen3-32b across ALL 5 keys
-    #   All exhausted → Ollama fallback
-
     llm_response = ""
 
-    # Outer loop: model first, then keys
-    # So all keys are tried with model A before falling back to model B
     for model_name in GROQ_MODEL_CASCADE:
         if llm_response:
             break
@@ -690,17 +680,17 @@ async def chat_with_notebook(
                 llm_response = completion.choices[0].message.content
                 key_index = groq_keys.index(groq_key) + 1
                 print(f"[Chat] Responded using Groq key #{key_index}, model: {model_name}")
-                break  # success — stop trying keys for this model
+                break
             except Exception as groq_err:
                 err_str = str(groq_err)
                 groq_last_error = err_str
                 key_index = groq_keys.index(groq_key) + 1
                 if "rate_limit_exceeded" in err_str or "429" in err_str:
                     print(f"[Chat] Groq key #{key_index} rate limited on {model_name}, trying next key...")
-                    continue  # try next key with same model
+                    continue
                 else:
                     print(f"[Chat] Groq key #{key_index} error on {model_name}: {groq_err}")
-                    break  # non-rate-limit error, skip remaining keys for this model
+                    break
 
     # 14. Ollama fallback
     if not llm_response and settings.OLLAMA_BASE_URL:
@@ -716,11 +706,11 @@ async def chat_with_notebook(
                     model_names = [m.get("name", "") for m in models]
                     print(f"[Ollama] Available models: {model_names}")
                     preferred = [
-                        "llama3.3:70b",    # same model as Groq — best quality
-                        "llama3.1:70b",    # close second
-                        "qwen2.5:32b",     # excellent mid-size
-                        "phi4:14b",        # best small model for RAG
-                        "llama3.1:8b",     # fast fallback
+                        "llama3.3:70b",
+                        "llama3.1:70b",
+                        "qwen2.5:32b",
+                        "phi4:14b",
+                        "llama3.1:8b",
                         "llama3.1",
                         "llama3:latest",
                         "llama3",
@@ -735,7 +725,6 @@ async def chat_with_notebook(
 
                 print(f"[Ollama] Using model: {available_model}")
 
-                # Short prompt for Ollama — keeps CPU inference fast
                 ollama_citations = citations_list[:3]
                 ollama_context = ""
                 for i, c in enumerate(ollama_citations):
@@ -808,7 +797,36 @@ async def chat_with_notebook(
                 ])
             )
 
+    # ── Save assistant turn + async memory updates ──────────────────────────
+    if llm_response:
+        # Save assistant turn to short-term memory
+        asst_turn_count = await save_turn(
+            db, notebook_id_str, user_id_str, conversation_id, "assistant", llm_response
+        )
+
+        # Store vector memory for this exchange (background thread)
+        exchange_text = f"User: {request.message}\nAssistant: {llm_response[:500]}"
+        threading.Thread(
+            target=store_memory_vector,
+            args=(qdrant_client, embed_model, notebook_id_str, conversation_id, exchange_text, "turn"),
+            daemon=True
+        ).start()
+
+        # Maybe summarise (background thread — every SUMMARISE_EVERY turns)
+        async def _bg_summarise():
+            try:
+                await maybe_summarise(
+                    db, notebook_id_str, user_id_str,
+                    conversation_id, asst_turn_count, groq_keys
+                )
+            except Exception as e:
+                print(f"[Memory] Background summarise error: {e}")
+
+        import asyncio
+        asyncio.ensure_future(_bg_summarise())
+
     return ChatResponse(
         response=llm_response,
-        citations=citations_list
+        citations=citations_list,
+        conversation_id=conversation_id
     )

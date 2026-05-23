@@ -33,6 +33,106 @@ interface Message {
   citations?: Citation[];
 }
 
+// ── CitationText: renders response text with inline hoverable citation numbers ──
+function CitationText({ content, citations }: { content: string; citations: Citation[] }) {
+  const [activeIdx, setActiveIdx] = useState<number | null>(null);
+  const [tooltipPos, setTooltipPos] = useState<{ top: number; left: number } | null>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const parts = content.split(/(\[\d+\])/g);
+
+  // Close on outside click — added with setTimeout so the opening click
+  // has already finished before the listener is registered.
+  useEffect(() => {
+    if (activeIdx === null) return;
+    let timerId: ReturnType<typeof setTimeout>;
+    const handler = (e: MouseEvent) => {
+      if (tooltipRef.current && tooltipRef.current.contains(e.target as Node)) return;
+      setActiveIdx(null);
+      setTooltipPos(null);
+    };
+    timerId = setTimeout(() => {
+      document.addEventListener("click", handler);
+    }, 0);
+    return () => {
+      clearTimeout(timerId);
+      document.removeEventListener("click", handler);
+    };
+  }, [activeIdx]);
+
+  const activeCit = activeIdx !== null ? (() => {
+    const match = parts[activeIdx]?.match(/^\[(\d+)\]$/);
+    if (!match) return null;
+    return citations[parseInt(match[1], 10) - 1] ?? null;
+  })() : null;
+
+  const handleBadgeClick = (e: React.MouseEvent<HTMLButtonElement>, partIdx: number) => {
+    e.stopPropagation();
+    if (activeIdx === partIdx) {
+      // clicking same badge closes it
+      setActiveIdx(null);
+      setTooltipPos(null);
+      return;
+    }
+    const rect = e.currentTarget.getBoundingClientRect();
+    const TW = 288;
+    let left = rect.left + rect.width / 2 - TW / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - TW - 8));
+    const top = rect.top - 8; // tooltip will translateY(-100%) so it sits above
+    setActiveIdx(partIdx);
+    setTooltipPos({ top, left });
+  };
+
+  return (
+    <>
+      <span className="whitespace-pre-wrap">
+        {parts.map((part, i) => {
+          const match = part.match(/^\[(\d+)\]$/);
+          if (match) {
+            const num = parseInt(match[1], 10);
+            const cit = citations[num - 1];
+            if (!cit) return <span key={i}>{part}</span>;
+            return (
+              <button
+                key={i}
+                onClick={(e) => handleBadgeClick(e, i)}
+                className="inline-flex items-center justify-center w-4 h-4 mx-0.5 text-[10px] font-bold rounded bg-primary/20 text-primary border border-primary/30 hover:bg-primary/40 transition-colors align-super cursor-pointer leading-none"
+              >
+                {num}
+              </button>
+            );
+          }
+          return <span key={i}>{part}</span>;
+        })}
+      </span>
+
+      {/* Fixed-position tooltip — rendered outside text flow, never overlaps */}
+      {activeIdx !== null && activeCit && tooltipPos && (
+        <div
+          ref={tooltipRef}
+          style={{
+            position: "fixed",
+            top: tooltipPos.top,
+            left: tooltipPos.left,
+            transform: "translateY(-100%)",
+            width: 288,
+            zIndex: 9999,
+          }}
+          className="rounded-xl border border-primary/30 bg-[#0e1120] shadow-2xl p-3 flex flex-col gap-1.5 text-left"
+        >
+          <span className="text-[11px] font-semibold text-primary truncate block">{activeCit.file_name}</span>
+          <span className="text-[11px] text-muted-foreground leading-relaxed line-clamp-5 block">{activeCit.text}</span>
+          <button
+            onClick={() => { setActiveIdx(null); setTooltipPos(null); }}
+            className="self-end text-[10px] text-muted-foreground hover:text-foreground mt-1"
+          >
+            Close
+          </button>
+        </div>
+      )}
+    </>
+  );
+}
+
 function WorkspaceContent() {
   const queryClient = useQueryClient();
   const searchParams = useSearchParams();
@@ -44,6 +144,7 @@ function WorkspaceContent() {
   const [showGraph, setShowGraph] = useState(true);
   const [selectedNotebookId, setSelectedNotebookId] = useState<string | null>(null);
   const [selectedDocIds, setSelectedDocIds] = useState<Set<string>>(new Set());
+  const [conversationId, setConversationId] = useState<string | null>(null);
   const [chatInput, setChatInput] = useState("");
   const [isPasteModalOpen, setIsPasteModalOpen] = useState(false);
   const [pasteTitle, setPasteTitle] = useState("");
@@ -255,9 +356,10 @@ function WorkspaceContent() {
     });
   };
 
-  // Reset doc selection when notebook changes
+  // Reset doc selection and conversation when notebook changes
   useEffect(() => {
     setSelectedDocIds(new Set());
+    setConversationId(null);
   }, [selectedNotebookId]);
 
   const handleSendMessage = async () => {
@@ -277,8 +379,13 @@ function WorkspaceContent() {
       const response = await sendChatMessage(
         userMsg,
         selectedNotebookId,
-        selectedDocIds.size > 0 ? Array.from(selectedDocIds) : undefined
+        selectedDocIds.size > 0 ? Array.from(selectedDocIds) : undefined,
+        conversationId || undefined
       );
+      // Persist conversation_id for memory continuity
+      if (response.conversation_id) {
+        setConversationId(response.conversation_id);
+      }
       setMessages((prev) => [...prev, {
         role: "assistant",
         content: response.response,
@@ -296,6 +403,7 @@ function WorkspaceContent() {
   };
 
   const handleClearChat = () => {
+    setConversationId(null);
     setMessages([
       {
         role: "assistant",
@@ -635,27 +743,10 @@ function WorkspaceContent() {
                 )}
                 
                 {isBot ? (
-                  <GlassCard className="rounded-tl-none p-5 max-w-[85%] border-primary/20" hoverEffect={false}>
-                    <div className="text-[15px] leading-relaxed text-foreground/90 whitespace-pre-wrap font-sans">
-                      {msg.content}
+  <GlassCard className="rounded-tl-none p-5 max-w-[85%] border-primary/20" hoverEffect={false}>
+                    <div className="text-[15px] leading-relaxed text-foreground/90 font-sans">
+                      <CitationText content={msg.content} citations={msg.citations || []} />
                     </div>
-                    {msg.citations && msg.citations.length > 0 && (
-                      <div className="mt-4 pt-4 border-t border-white/10">
-                        <div className="text-xs font-semibold text-foreground mb-2 flex items-center gap-1">
-                          <Sparkles className="w-3.5 h-3.5 text-primary" /> Source Citations
-                        </div>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                          {msg.citations.map((cit, cIdx) => (
-                            <div key={cIdx} className="p-3 rounded-lg bg-black/20 border border-white/5 hover:border-primary/30 cursor-pointer transition-colors group">
-                              <div className="text-[10px] font-mono text-primary mb-1">[{cIdx + 1}] {cit.file_name}</div>
-                              <p className="text-xs text-muted-foreground line-clamp-2 group-hover:text-foreground transition-colors">
-                                {cit.text}
-                              </p>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
                   </GlassCard>
                 ) : (
                   <div className="bg-surface-hover border border-white/10 rounded-2xl rounded-tr-none p-5 max-w-[85%]">
