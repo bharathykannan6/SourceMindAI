@@ -7,8 +7,15 @@ import { AnimatedButton } from "@/components/ui/AnimatedButton";
 import { 
   FileText, Search, Folder, Plus, Bot, ArrowUpRight, 
   Paperclip, Mic, Send, Network, Loader2, Sparkles, X, LayoutTemplate, Trash2,
-  CheckSquare, CheckCheck, Filter, RotateCcw, Pencil
+  CheckSquare, CheckCheck, Filter, RotateCcw, Pencil, ExternalLink
 } from "lucide-react";
+
+// Inline YouTube SVG — lucide-react@0.383 does not export Youtube
+const YoutubeSVG = ({ className }: { className?: string }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+    <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
+  </svg>
+);
 import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -21,6 +28,7 @@ import {
   deleteNotebook,
   sendChatMessage, 
   ingestText,
+  ingestUrl,
   deleteDocument,
   Document, 
   Notebook, 
@@ -149,6 +157,12 @@ function WorkspaceContent() {
   const [isPasteModalOpen, setIsPasteModalOpen] = useState(false);
   const [pasteTitle, setPasteTitle] = useState("");
   const [pasteText, setPasteText] = useState("");
+
+  const [isYoutubeModalOpen, setIsYoutubeModalOpen] = useState(false);
+  const [youtubeUrl, setYoutubeUrl] = useState("");
+  const [youtubeFetchingTitle, setYoutubeFetchingTitle] = useState(false);
+  const [youtubeTitle, setYoutubeTitle] = useState("");
+  const [youtubeError, setYoutubeError] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([
     {
       role: "assistant",
@@ -261,6 +275,41 @@ function WorkspaceContent() {
       alert("Failed to ingest pasted text: " + (error as any).message);
     }
   });
+
+  // YouTube Ingest Mutation
+  const youtubeMutation = useMutation({
+    mutationFn: ({ url, title }: { url: string; title: string }) =>
+      ingestUrl(url, title || undefined, selectedNotebookId || undefined),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['documents', selectedNotebookId] });
+      setIsYoutubeModalOpen(false);
+      setYoutubeUrl("");
+      setYoutubeTitle("");
+      setYoutubeError(null);
+    },
+    onError: (error: any) => {
+      const msg = error?.response?.data?.detail || error?.message || "Failed to fetch transcript.";
+      setYoutubeError(msg);
+    }
+  });
+
+  // Fetch real video title from YouTube oEmbed when URL changes
+  const handleYoutubeUrlChange = async (url: string) => {
+    setYoutubeUrl(url);
+    setYoutubeError(null);
+    const isYT = url.includes("youtube.com/watch") || url.includes("youtu.be/");
+    if (!isYT) { setYoutubeTitle(""); return; }
+    setYoutubeFetchingTitle(true);
+    try {
+      const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
+      const res = await fetch(oembedUrl);
+      if (res.ok) {
+        const data = await res.json();
+        setYoutubeTitle(data.title || "");
+      }
+    } catch { /* silently ignore */ }
+    finally { setYoutubeFetchingTitle(false); }
+  };
 
   // Delete Document Mutation
   const deleteDocumentMutation = useMutation({
@@ -666,15 +715,32 @@ function WorkspaceContent() {
             </div>
           )}
 
-          <AnimatedButton
-            className="w-full h-9 mt-3 text-xs"
-            variant="outline"
-            onClick={() => setIsPasteModalOpen(true)}
-            disabled={!selectedNotebookId || pasteMutation.isPending}
-          >
-            <FileText className="w-3.5 h-3.5 mr-1.5" />
-            {pasteMutation.isPending ? "Ingesting..." : "Paste Text"}
-          </AnimatedButton>
+          <div className="flex gap-2 mt-3">
+            <AnimatedButton
+              className="flex-1 h-9 text-xs"
+              variant="outline"
+              onClick={() => setIsPasteModalOpen(true)}
+              disabled={!selectedNotebookId || pasteMutation.isPending}
+            >
+              <FileText className="w-3.5 h-3.5 mr-1.5" />
+              {pasteMutation.isPending ? "Ingesting..." : "Paste Text"}
+            </AnimatedButton>
+            <AnimatedButton
+              className="flex-1 h-9 text-xs"
+              variant="outline"
+              onClick={() => {
+                if (!selectedNotebookId) { alert("Please select a notebook first."); return; }
+                setYoutubeUrl("");
+                setYoutubeTitle("");
+                setYoutubeError(null);
+                setIsYoutubeModalOpen(true);
+              }}
+              disabled={!selectedNotebookId || youtubeMutation.isPending}
+            >
+              <YoutubeSVG className="w-3.5 h-3.5 mr-1.5 text-red-400" />
+              {youtubeMutation.isPending ? "Fetching..." : "YouTube"}
+            </AnimatedButton>
+          </div>
         </div>
       </div>
 
@@ -1032,6 +1098,107 @@ function WorkspaceContent() {
                       <Loader2 className="w-4 h-4 animate-spin" /> Ingesting...
                     </span>
                   ) : "Ingest Text"}
+                </AnimatedButton>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      {/* YouTube URL Modal */}
+      <AnimatePresence>
+        {isYoutubeModalOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-surface border border-white/10 rounded-2xl p-6 w-full max-w-lg shadow-2xl flex flex-col gap-4 relative"
+            >
+              <button
+                onClick={() => setIsYoutubeModalOpen(false)}
+                className="absolute top-4 right-4 text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+
+              <h3 className="text-lg font-semibold flex items-center gap-2">
+                <YoutubeSVG className="w-5 h-5 text-red-400" />
+                Add YouTube Video
+              </h3>
+
+              <p className="text-xs text-muted-foreground -mt-2">
+                Paste a YouTube link. The transcript will be fetched and stored as a document you can chat with.
+              </p>
+
+              <div className="flex flex-col gap-2">
+                <label className="text-xs font-medium text-muted-foreground">YouTube URL *</label>
+                <div className="relative">
+                  <input
+                    type="url"
+                    value={youtubeUrl}
+                    onChange={(e) => handleYoutubeUrlChange(e.target.value)}
+                    placeholder="https://www.youtube.com/watch?v=..."
+                    className="w-full bg-surface-light border border-white/10 rounded-lg px-3 py-2 pr-10 text-sm focus:outline-none focus:border-primary/50 text-foreground"
+                    autoFocus
+                  />
+                  {youtubeFetchingTitle && (
+                    <Loader2 className="w-4 h-4 animate-spin text-primary absolute right-3 top-2.5" />
+                  )}
+                </div>
+              </div>
+
+              {/* Auto-fetched title preview */}
+              {youtubeTitle && (
+                <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 rounded-lg px-3 py-2">
+                  <YoutubeSVG className="w-4 h-4 text-red-400 flex-shrink-0" />
+                  <span className="text-sm text-foreground truncate">{youtubeTitle}</span>
+                </div>
+              )}
+
+              {/* Validation message */}
+              {youtubeUrl && !youtubeUrl.includes("youtube.com") && !youtubeUrl.includes("youtu.be") && (
+                <p className="text-xs text-yellow-400 flex items-center gap-1">
+                  <ExternalLink className="w-3 h-3" /> This doesn&apos;t look like a YouTube URL.
+                </p>
+              )}
+
+              {/* Error */}
+              {youtubeError && (
+                <div className="p-2 rounded-lg bg-red-500/10 border border-red-500/20 text-xs text-red-400">
+                  <strong>Error:</strong> {youtubeError}
+                  {youtubeError.includes("Transcript") || youtubeError.includes("transcript") ? (
+                    <p className="mt-1 text-red-300">This video may have transcripts disabled or be in a language not supported.</p>
+                  ) : null}
+                </div>
+              )}
+
+              <div className="flex justify-end gap-3 mt-2">
+                <AnimatedButton variant="outline" onClick={() => setIsYoutubeModalOpen(false)}>
+                  Cancel
+                </AnimatedButton>
+                <AnimatedButton
+                  variant="primary"
+                  onClick={() => youtubeMutation.mutate({ url: youtubeUrl, title: youtubeTitle })}
+                  disabled={
+                    !youtubeUrl.trim() ||
+                    (!youtubeUrl.includes("youtube.com") && !youtubeUrl.includes("youtu.be")) ||
+                    youtubeMutation.isPending
+                  }
+                >
+                  {youtubeMutation.isPending ? (
+                    <span className="flex items-center gap-2">
+                      <Loader2 className="w-4 h-4 animate-spin" /> Fetching transcript...
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-2">
+                      <YoutubeSVG className="w-4 h-4" /> Add Transcript
+                    </span>
+                  )}
                 </AnimatedButton>
               </div>
             </motion.div>
