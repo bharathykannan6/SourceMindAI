@@ -16,8 +16,13 @@ from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
 from groq import Groq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct,
+    SparseVector, SparseVectorParams, SparseIndexParams, NamedSparseVector,
+)
 from sentence_transformers import SentenceTransformer
 
 from app.core.config import settings
@@ -88,6 +93,28 @@ print("[Ingestion] Embedding model loaded.")
 
 EMBED_DIM = 768
 
+# ── Sparse BM25 encoder — loaded once at startup ───────────────────────────────
+# BM25Encoder is built into qdrant-client. It tokenises text and produces
+# sparse (indices, values) pairs that Qdrant's inverted index can search.
+# .default() loads a pre-built IDF table from the web on first call and
+# caches it locally — subsequent startups are instant.
+# This replaces the Python BM25 loop in chat.py (scroll 3000 chunks into RAM,
+# build inverted index, score in a loop). Qdrant handles all of that internally.
+print("[Ingestion] Loading BM25 sparse encoder...")
+try:
+    from fastembed import SparseTextEmbedding
+    _bm25_model_name = "Qdrant/bm25"
+    bm25_encoder = SparseTextEmbedding(model_name=_bm25_model_name)
+    SPARSE_VECTOR_NAME = "bm25"
+    SPARSE_ENABLED = True
+    print("[Ingestion] BM25 sparse encoder loaded (fastembed).")
+except Exception as _bm25_err:
+    print(f"[Ingestion] WARNING: BM25 sparse encoder unavailable: {_bm25_err}")
+    print("[Ingestion] Sparse vectors DISABLED — install fastembed: pip install fastembed")
+    bm25_encoder = None
+    SPARSE_VECTOR_NAME = "bm25"
+    SPARSE_ENABLED = False
+
 qdrant_client = QdrantClient(
     host=settings.QDRANT_HOST,
     port=settings.QDRANT_PORT,
@@ -145,24 +172,60 @@ def update_document_status_sync(document_id: str, new_status: str, error_message
 # ─────────────────────────────────────────────────────────────────────────────
 
 def init_qdrant():
+    """
+    Ensure the Qdrant collection exists with the correct schema.
+
+    Schema depends on whether SPARSE_ENABLED is True:
+      - SPARSE_ENABLED=True  : dense (768-dim cosine) + sparse (bm25 inverted index)
+      - SPARSE_ENABLED=False : dense only (original schema, full backward compat)
+
+    If the collection exists but has the wrong dense vector size, it is recreated.
+    If the collection exists with dense-only schema and SPARSE_ENABLED=True,
+    it is recreated so sparse vectors can be stored (requires re-ingestion).
+    """
     collections = qdrant_client.get_collections().collections
     existing = next((c for c in collections if c.name == VECTOR_COLLECTION), None)
+
     if existing:
         info = qdrant_client.get_collection(VECTOR_COLLECTION)
         current_size = info.config.params.vectors.size
+        has_sparse = bool(
+            info.config.params.sparse_vectors
+            if hasattr(info.config.params, "sparse_vectors") else False
+        )
+
+        needs_recreate = False
         if current_size != EMBED_DIM:
-            print(f"[Qdrant] Wrong vector size ({current_size} != {EMBED_DIM}). Recreating...")
+            print(f"[Qdrant] Wrong dense vector size ({current_size} != {EMBED_DIM}). Recreating...")
+            needs_recreate = True
+        elif SPARSE_ENABLED and not has_sparse:
+            print("[Qdrant] Collection exists without sparse vectors but SPARSE_ENABLED=True. "
+                  "Recreating to add sparse index. All documents must be re-ingested.")
+            needs_recreate = True
+
+        if needs_recreate:
             qdrant_client.delete_collection(VECTOR_COLLECTION)
-            qdrant_client.create_collection(
-                collection_name=VECTOR_COLLECTION,
-                vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
-            )
+        else:
+            return  # collection is correct, nothing to do
+
+    # Create with correct schema
+    if SPARSE_ENABLED:
+        qdrant_client.create_collection(
+            collection_name=VECTOR_COLLECTION,
+            vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+            sparse_vectors_config={
+                SPARSE_VECTOR_NAME: SparseVectorParams(
+                    index=SparseIndexParams(on_disk=False)  # keep in RAM for speed
+                )
+            },
+        )
+        print(f"[Qdrant] Collection created: dense={EMBED_DIM}-dim + sparse={SPARSE_VECTOR_NAME}")
     else:
         qdrant_client.create_collection(
             collection_name=VECTOR_COLLECTION,
             vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
         )
-        print(f"[Qdrant] Collection created with size={EMBED_DIM}")
+        print(f"[Qdrant] Collection created: dense={EMBED_DIM}-dim only (sparse disabled)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -653,17 +716,150 @@ def process_document(document_id: str, file_path: str, file_type: str, notebook_
 
         print(f"[Ingestion] Extracted {len(text):,} chars from document_id={document_id}")
 
-        # 2. Chunk
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1500,
-            chunk_overlap=300,
-            length_function=len,
-            separators=["\n\n\n", "\n\n", "\n", ". ", " ", ""]
-        )
-        chunks = text_splitter.split_text(text)
+        # 2. Chunk — Semantic-aware splitting
+        #
+        # Strategy: SemanticChunker detects topic-shift boundaries between
+        # consecutive sentences using cosine similarity of their embeddings.
+        # Each chunk is a complete thought, not a mechanical 1500-char slice.
+        #
+        # Fallback logic (three levels):
+        #   Level 1 — SemanticChunker with percentile breakpoint (preferred)
+        #             Splits where similarity drops below the Nth percentile.
+        #             breakpoint_threshold_amount=85 means a split occurs when
+        #             a sentence pair is less similar than 85% of all pairs —
+        #             aggressive enough to separate topics, conservative enough
+        #             not to over-fragment dense technical text.
+        #
+        #   Level 2 — SemanticChunker with standard_deviation breakpoint
+        #             Falls back if percentile mode raises any error.
+        #             Splits where similarity drops more than 1 std-dev below mean.
+        #
+        #   Level 3 — RecursiveCharacterTextSplitter (original)
+        #             Falls back if both semantic modes fail (e.g. very short
+        #             document with only 1–2 sentences, or library version mismatch).
+        #             Guarantees ingestion always completes.
+        #
+        # Chunk size guardrails:
+        #   Semantic chunks can be very large (an entire section) or very small
+        #   (a one-sentence paragraph). We enforce:
+        #     - min_chars: chunks under 100 chars are merged with the next chunk
+        #     - max_chars: chunks over 3000 chars are re-split with the
+        #                  RecursiveCharacterTextSplitter at 1500-char boundaries
+        #   This prevents the LLM from receiving either empty slivers or
+        #   context-window-busting walls of text.
+        #
+        # SemanticChunker wraps the embed_model already loaded at startup
+        # via a thin LangChain-compatible adapter — no second model is loaded.
+
+        MIN_CHUNK_CHARS = 100
+        MAX_CHUNK_CHARS = 3000
+
+        # For large files SemanticChunker is too slow — skip directly to RecursiveCharacter
+        SEMANTIC_CHUNKER_MAX_CHARS = 500_000
+
+        from langchain_core.embeddings import Embeddings as LCEmbeddings
+
+        class _STEmbeddings(LCEmbeddings):
+            def embed_documents(self, texts):
+                return embed_model.encode(
+                    texts, convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False
+                ).tolist()
+
+            def embed_query(self, text):
+                return embed_model.encode(
+                    text, convert_to_numpy=True,
+                    normalize_embeddings=True
+                ).tolist()
+
+        lc_embeddings = _STEmbeddings()
+
+        chunks = []
+        _chunker_used = "unknown"
+
+        if len(text) > SEMANTIC_CHUNKER_MAX_CHARS:
+            print(f"[Ingestion] Large file ({len(text):,} chars) — using RecursiveCharacter chunker")
+            _rc = RecursiveCharacterTextSplitter(
+                chunk_size=1500, chunk_overlap=300, length_function=len,
+                separators=["\n\n\n", "\n\n", "\n", ". ", " ", ""]
+            )
+            chunks = _rc.split_text(text)
+            _chunker_used = "recursive/character (large file)"
+        else:
+            # Level 1: SemanticChunker with percentile breakpoint
+            try:
+                semantic_splitter = SemanticChunker(
+                    embeddings=lc_embeddings,
+                    breakpoint_threshold_type="percentile",
+                    breakpoint_threshold_amount=85,
+                )
+                chunks = semantic_splitter.split_text(text)
+                _chunker_used = "semantic/percentile"
+            except Exception as _sem_err1:
+                print(f"[Ingestion] SemanticChunker/percentile failed: {_sem_err1} — trying std_dev")
+                # Level 2: standard_deviation breakpoint
+                try:
+                    semantic_splitter = SemanticChunker(
+                        embeddings=lc_embeddings,
+                        breakpoint_threshold_type="standard_deviation",
+                        breakpoint_threshold_amount=1.0,
+                    )
+                    chunks = semantic_splitter.split_text(text)
+                    _chunker_used = "semantic/std_dev"
+                except Exception as _sem_err2:
+                    print(f"[Ingestion] SemanticChunker/std_dev failed: {_sem_err2} — falling back to RecursiveCharacter")
+
+        # Level 3: character-based fallback
+        if not chunks:
+            fallback_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1500,
+                chunk_overlap=300,
+                length_function=len,
+                separators=["\n\n\n", "\n\n", "\n", ". ", " ", ""]
+            )
+            chunks = fallback_splitter.split_text(text)
+            _chunker_used = "recursive/character"
+
+        # Guardrail: merge tiny chunks and re-split oversized ones
+        guarded_chunks = []
+        _pending = ""
+        for _c in chunks:
+            _combined = (_pending + " " + _c).strip() if _pending else _c
+            if len(_combined) < MIN_CHUNK_CHARS:
+                # Too small — accumulate into next chunk
+                _pending = _combined
+            elif len(_combined) > MAX_CHUNK_CHARS:
+                # Flush pending first
+                if _pending:
+                    guarded_chunks.append(_pending)
+                    _pending = ""
+                # Re-split oversized chunk at character boundaries
+                _resplitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1500, chunk_overlap=200,
+                    separators=["\n\n", "\n", ". ", " ", ""]
+                )
+                guarded_chunks.extend(_resplitter.split_text(_c))
+            else:
+                if _pending:
+                    _combined2 = (_pending + " " + _c).strip()
+                    if len(_combined2) <= MAX_CHUNK_CHARS:
+                        guarded_chunks.append(_combined2)
+                        _pending = ""
+                        continue
+                    else:
+                        guarded_chunks.append(_pending)
+                        _pending = ""
+                guarded_chunks.append(_c)
+        if _pending:
+            guarded_chunks.append(_pending)
+
+        chunks = [c for c in guarded_chunks if c.strip()]
+
         if not chunks:
             raise ValueError("No chunks generated from text")
 
+        print(f"[Ingestion] Chunker used: {_chunker_used}")
         total_chunks = len(chunks)
         print(f"[Ingestion] Created {total_chunks:,} chunks for document_id={document_id}")
 
@@ -673,7 +869,7 @@ def process_document(document_id: str, file_path: str, file_type: str, notebook_
             chunks = [chunks[i] for i in indices]
             print(f"[Ingestion] Sampled {MAX_CHUNKS_PER_DOC:,} from {total_chunks:,} chunks")
 
-        # 3. Embed
+        # 3. Embed (dense vectors)
         all_embeddings = []
         n_chunks = len(chunks)
         for batch_start in range(0, n_chunks, EMBED_BATCH_SIZE):
@@ -688,20 +884,58 @@ def process_document(document_id: str, file_path: str, file_type: str, notebook_
 
         embeddings = np.vstack(all_embeddings)
 
+        # 3b. Sparse vectors (BM25) — only if encoder is available
+        sparse_vectors_list = [None] * n_chunks
+        if SPARSE_ENABLED and bm25_encoder is not None:
+            try:
+                print(f"[Ingestion] Generating sparse vectors for {n_chunks} chunks...")
+                # SparseTextEmbedding.embed() returns a generator of EmbeddingResult
+                sparse_results = list(bm25_encoder.embed(chunks, batch_size=64))
+                for i, result in enumerate(sparse_results):
+                    # fastembed returns objects with .indices and .values attributes
+                    indices = result.indices.tolist() if hasattr(result.indices, 'tolist') else list(result.indices)
+                    values  = result.values.tolist()  if hasattr(result.values,  'tolist') else list(result.values)
+                    if indices and values:
+                        sparse_vectors_list[i] = SparseVector(indices=indices, values=values)
+                print(f"[Ingestion] Sparse vectors generated.")
+            except Exception as _sp_err:
+                print(f"[Ingestion] WARNING: Sparse vector generation failed: {_sp_err} — "
+                      f"storing dense-only points for this document.")
+                sparse_vectors_list = [None] * n_chunks
+
         # 4. Store in Qdrant
-        points = [
-            PointStruct(
-                id=str(uuid.uuid4()),
-                vector=embedding.tolist(),
-                payload={
-                    "document_id": str(document_id),
-                    "notebook_id": str(notebook_id),
-                    "text": chunk_text,
-                    "chunk_index": i,
-                }
-            )
-            for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings))
-        ]
+        # Each point carries: dense vector + optional sparse vector + payload.
+        # Points without a sparse vector (SPARSE_ENABLED=False or generation failed)
+        # are stored with dense only — fully compatible with existing search logic.
+        points = []
+        for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
+            sparse_vec = sparse_vectors_list[i]
+            if SPARSE_ENABLED and sparse_vec is not None:
+                point = PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector={
+                        "":          embedding.tolist(),          # dense (unnamed = default)
+                        SPARSE_VECTOR_NAME: sparse_vec,           # sparse bm25
+                    },
+                    payload={
+                        "document_id": str(document_id),
+                        "notebook_id": str(notebook_id),
+                        "text":        chunk_text,
+                        "chunk_index": i,
+                    }
+                )
+            else:
+                point = PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=embedding.tolist(),
+                    payload={
+                        "document_id": str(document_id),
+                        "notebook_id": str(notebook_id),
+                        "text":        chunk_text,
+                        "chunk_index": i,
+                    }
+                )
+            points.append(point)
 
         init_qdrant()
         fresh_qdrant = QdrantClient(

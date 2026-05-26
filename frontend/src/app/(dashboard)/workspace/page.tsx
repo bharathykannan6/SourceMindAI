@@ -1,13 +1,14 @@
 "use client";
 
-import { useState, useRef, useEffect, Suspense } from "react";
+import { useState, useRef, useEffect, Suspense, useCallback } from "react";
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { AnimatedButton } from "@/components/ui/AnimatedButton";
 import { 
   FileText, Search, Folder, Plus, Bot, ArrowUpRight, 
   Paperclip, Mic, Send, Network, Loader2, Sparkles, X, LayoutTemplate, Trash2,
-  CheckSquare, CheckCheck, Filter, RotateCcw, Pencil, ExternalLink
+  CheckSquare, CheckCheck, Filter, RotateCcw, Pencil, ExternalLink,
+  Download, FileDown
 } from "lucide-react";
 
 // Inline YouTube SVG — lucide-react@0.383 does not export Youtube
@@ -41,80 +42,299 @@ interface Message {
   citations?: Citation[];
 }
 
-// ── CitationText: renders response text with inline hoverable citation numbers ──
-function CitationText({ content, citations }: { content: string; citations: Citation[] }) {
-  const [activeIdx, setActiveIdx] = useState<number | null>(null);
-  const [tooltipPos, setTooltipPos] = useState<{ top: number; left: number } | null>(null);
-  const tooltipRef = useRef<HTMLDivElement>(null);
-  const parts = content.split(/(\[\d+\])/g);
+// ── MarkdownCitation: renders LLM markdown + hoverable citation badges ──────
+//
+// Handles the full set of Markdown tokens that Groq/LLaMA produces:
+//   ## / ### headers, **bold**, *italic*, `inline code`, ```code blocks```,
+//   - / * / + unordered lists, 1. ordered lists, --- horizontal rules,
+//   and [N] citation badges injected inline.
+//
+// Zero external dependencies — pure React + Tailwind.
 
-  // Close on outside click — added with setTimeout so the opening click
-  // has already finished before the listener is registered.
-  useEffect(() => {
-    if (activeIdx === null) return;
-    let timerId: ReturnType<typeof setTimeout>;
-    const handler = (e: MouseEvent) => {
-      if (tooltipRef.current && tooltipRef.current.contains(e.target as Node)) return;
-      setActiveIdx(null);
-      setTooltipPos(null);
-    };
-    timerId = setTimeout(() => {
-      document.addEventListener("click", handler);
-    }, 0);
-    return () => {
-      clearTimeout(timerId);
-      document.removeEventListener("click", handler);
-    };
-  }, [activeIdx]);
+type MdToken =
+  | { t: "h1" | "h2" | "h3"; children: MdToken[] }
+  | { t: "p"; children: MdToken[] }
+  | { t: "ul"; items: MdToken[][] }
+  | { t: "ol"; items: MdToken[][] }
+  | { t: "code"; lang: string; text: string }
+  | { t: "hr" }
+  | { t: "blank" };
 
-  const activeCit = activeIdx !== null ? (() => {
-    const match = parts[activeIdx]?.match(/^\[(\d+)\]$/);
-    if (!match) return null;
-    return citations[parseInt(match[1], 10) - 1] ?? null;
-  })() : null;
+type InlineToken =
+  | { i: "text"; text: string }
+  | { i: "bold"; text: string }
+  | { i: "italic"; text: string }
+  | { i: "bolditalic"; text: string }
+  | { i: "code"; text: string }
+  | { i: "cite"; num: number };
 
-  const handleBadgeClick = (e: React.MouseEvent<HTMLButtonElement>, partIdx: number) => {
-    e.stopPropagation();
-    if (activeIdx === partIdx) {
-      // clicking same badge closes it
-      setActiveIdx(null);
-      setTooltipPos(null);
-      return;
+// ── Inline tokeniser ─────────────────────────────────────────────────────────
+function tokeniseInline(raw: string): InlineToken[] {
+  const tokens: InlineToken[] = [];
+  // Pattern order matters: longest/most specific first
+  const re = /(\*\*\*(.+?)\*\*\*)|(\*\*(.+?)\*\*)|(\*(.+?)\*)|(___(.+?)___)|(__(.+?)__)|(_(. +?)_)|(`([^`]+)`)|(\[(\d+)\])/gs;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) {
+    if (m.index > last) tokens.push({ i: "text", text: raw.slice(last, m.index) });
+    if (m[1])  tokens.push({ i: "bolditalic", text: m[2] });
+    else if (m[3])  tokens.push({ i: "bold",      text: m[4] });
+    else if (m[5])  tokens.push({ i: "italic",    text: m[6] });
+    else if (m[7])  tokens.push({ i: "bolditalic", text: m[8] });
+    else if (m[9])  tokens.push({ i: "bold",      text: m[10] });
+    else if (m[11]) tokens.push({ i: "italic",    text: m[12] });
+    else if (m[13]) tokens.push({ i: "code",      text: m[14] });
+    else if (m[15]) tokens.push({ i: "cite",      num: parseInt(m[16], 10) });
+    last = m.index + m[0].length;
+  }
+  if (last < raw.length) tokens.push({ i: "text", text: raw.slice(last) });
+  return tokens;
+}
+
+// ── Block tokeniser ──────────────────────────────────────────────────────────
+function tokeniseBlocks(md: string): MdToken[] {
+  const lines = md.split("\n");
+  const blocks: MdToken[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Fenced code block
+    const fenceMatch = line.match(/^```(\w*)/);
+    if (fenceMatch) {
+      const lang = fenceMatch[1] || "";
+      const codeLines: string[] = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith("```")) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      i++; // skip closing ```
+      blocks.push({ t: "code", lang, text: codeLines.join("\n") });
+      continue;
     }
-    const rect = e.currentTarget.getBoundingClientRect();
-    const TW = 288;
-    let left = rect.left + rect.width / 2 - TW / 2;
-    left = Math.max(8, Math.min(left, window.innerWidth - TW - 8));
-    const top = rect.top - 8; // tooltip will translateY(-100%) so it sits above
-    setActiveIdx(partIdx);
-    setTooltipPos({ top, left });
-  };
 
+    // Headings
+    if (/^### (.+)/.test(line)) { blocks.push({ t: "h3", children: tokeniseInline(line.replace(/^### /, "")) }); i++; continue; }
+    if (/^## (.+)/.test(line))  { blocks.push({ t: "h2", children: tokeniseInline(line.replace(/^## /, "")) }); i++; continue; }
+    if (/^# (.+)/.test(line))   { blocks.push({ t: "h1", children: tokeniseInline(line.replace(/^# /, "")) }); i++; continue; }
+
+    // Horizontal rule
+    if (/^(---+|\*\*\*+|___+)$/.test(line.trim())) { blocks.push({ t: "hr" }); i++; continue; }
+
+    // Unordered list
+    if (/^[-*+] /.test(line)) {
+      const items: MdToken[][] = [];
+      while (i < lines.length && /^[-*+] /.test(lines[i])) {
+        items.push(tokeniseInline(lines[i].replace(/^[-*+] /, "")));
+        i++;
+      }
+      blocks.push({ t: "ul", items });
+      continue;
+    }
+
+    // Ordered list
+    if (/^\d+[.)\s]/.test(line)) {
+      const items: MdToken[][] = [];
+      while (i < lines.length && /^\d+[.)\s]/.test(lines[i])) {
+        items.push(tokeniseInline(lines[i].replace(/^\d+[.)\s]+/, "")));
+        i++;
+      }
+      blocks.push({ t: "ol", items });
+      continue;
+    }
+
+    // Blank line
+    if (line.trim() === "") { blocks.push({ t: "blank" }); i++; continue; }
+
+    // Paragraph — accumulate until blank/special
+    const paraLines: string[] = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() !== "" &&
+      !/^(#{1,3} |```|[-*+] |\d+[.)\s]|---|\*\*\*|___)/.test(lines[i])
+    ) {
+      paraLines.push(lines[i]);
+      i++;
+    }
+    if (paraLines.length) {
+      blocks.push({ t: "p", children: tokeniseInline(paraLines.join(" ")) });
+    }
+  }
+  return blocks;
+}
+
+// ── Inline renderer ──────────────────────────────────────────────────────────
+function RenderInline({
+  tokens,
+  citations,
+  onCite,
+  activeIdx,
+}: {
+  tokens: InlineToken[];
+  citations: Citation[];
+  onCite: (num: number, e: React.MouseEvent<HTMLButtonElement>) => void;
+  activeIdx: number | null;
+}) {
   return (
     <>
-      <span className="whitespace-pre-wrap">
-        {parts.map((part, i) => {
-          const match = part.match(/^\[(\d+)\]$/);
-          if (match) {
-            const num = parseInt(match[1], 10);
-            const cit = citations[num - 1];
-            if (!cit) return <span key={i}>{part}</span>;
+      {tokens.map((tok, idx) => {
+        switch (tok.i) {
+          case "bold":       return <strong key={idx} className="font-semibold text-foreground">{tok.text}</strong>;
+          case "italic":     return <em key={idx} className="italic text-foreground/80">{tok.text}</em>;
+          case "bolditalic": return <strong key={idx} className="font-semibold italic text-foreground">{tok.text}</strong>;
+          case "code":       return <code key={idx} className="px-1.5 py-0.5 rounded bg-white/8 border border-white/10 font-mono text-[13px] text-primary/90">{tok.text}</code>;
+          case "cite": {
+            const cit = citations[tok.num - 1];
+            if (!cit) return <span key={idx} className="text-muted-foreground text-xs">[{tok.num}]</span>;
             return (
               <button
-                key={i}
-                onClick={(e) => handleBadgeClick(e, i)}
-                className="inline-flex items-center justify-center w-4 h-4 mx-0.5 text-[10px] font-bold rounded bg-primary/20 text-primary border border-primary/30 hover:bg-primary/40 transition-colors align-super cursor-pointer leading-none"
+                key={idx}
+                onClick={(e) => onCite(tok.num, e)}
+                className="inline-flex items-center justify-center w-[18px] h-[18px] mx-[2px] text-[10px] font-bold rounded-full bg-primary/20 text-primary border border-primary/40 hover:bg-primary/40 transition-colors align-super cursor-pointer leading-none shadow-sm"
               >
-                {num}
+                {tok.num}
               </button>
             );
           }
-          return <span key={i}>{part}</span>;
-        })}
-      </span>
+          default: return <span key={idx}>{tok.text}</span>;
+        }
+      })}
+    </>
+  );
+}
 
-      {/* Fixed-position tooltip — rendered outside text flow, never overlaps */}
-      {activeIdx !== null && activeCit && tooltipPos && (
+// ── Block renderer ───────────────────────────────────────────────────────────
+function RenderBlocks({
+  blocks,
+  citations,
+  onCite,
+  activeIdx,
+}: {
+  blocks: MdToken[];
+  citations: Citation[];
+  onCite: (num: number, e: React.MouseEvent<HTMLButtonElement>) => void;
+  activeIdx: number | null;
+}) {
+  const inlineProps = { citations, onCite, activeIdx };
+
+  return (
+    <div className="space-y-3">
+      {blocks.map((block, bi) => {
+        switch (block.t) {
+          case "h1":
+            return (
+              <h1 key={bi} className="text-xl font-bold text-foreground mt-5 mb-2 leading-snug">
+                <RenderInline tokens={block.children} {...inlineProps} />
+              </h1>
+            );
+          case "h2":
+            return (
+              <h2 key={bi} className="text-[17px] font-semibold text-foreground/95 mt-4 mb-1.5 pb-1 border-b border-white/8 leading-snug">
+                <RenderInline tokens={block.children} {...inlineProps} />
+              </h2>
+            );
+          case "h3":
+            return (
+              <h3 key={bi} className="text-[15px] font-semibold text-primary/90 mt-3 mb-1 leading-snug">
+                <RenderInline tokens={block.children} {...inlineProps} />
+              </h3>
+            );
+          case "p":
+            return (
+              <p key={bi} className="text-[15px] leading-[1.75] text-foreground/90">
+                <RenderInline tokens={block.children} {...inlineProps} />
+              </p>
+            );
+          case "ul":
+            return (
+              <ul key={bi} className="space-y-1.5 pl-1">
+                {block.items.map((item, ii) => (
+                  <li key={ii} className="flex gap-2.5 text-[15px] leading-[1.7] text-foreground/85">
+                    <span className="mt-[7px] w-1.5 h-1.5 rounded-full bg-primary/60 flex-shrink-0" />
+                    <span><RenderInline tokens={item} {...inlineProps} /></span>
+                  </li>
+                ))}
+              </ul>
+            );
+          case "ol":
+            return (
+              <ol key={bi} className="space-y-1.5 pl-1">
+                {block.items.map((item, ii) => (
+                  <li key={ii} className="flex gap-3 text-[15px] leading-[1.7] text-foreground/85">
+                    <span className="flex-shrink-0 w-6 h-6 rounded-full bg-primary/10 border border-primary/25 text-primary text-[11px] font-bold flex items-center justify-center mt-0.5">{ii + 1}</span>
+                    <span className="pt-0.5"><RenderInline tokens={item} {...inlineProps} /></span>
+                  </li>
+                ))}
+              </ol>
+            );
+          case "code":
+            return (
+              <div key={bi} className="rounded-xl overflow-hidden border border-white/10 my-2">
+                {block.lang && (
+                  <div className="px-4 py-1.5 bg-white/5 border-b border-white/10 text-[11px] font-mono text-muted-foreground">{block.lang}</div>
+                )}
+                <pre className="p-4 overflow-x-auto bg-[#0a0f1e] text-[13px] font-mono text-green-300/90 leading-relaxed">
+                  <code>{block.text}</code>
+                </pre>
+              </div>
+            );
+          case "hr":
+            return <hr key={bi} className="border-white/10 my-3" />;
+          case "blank":
+            return null;
+          default:
+            return null;
+        }
+      })}
+    </div>
+  );
+}
+
+// ── CitationText: top-level component used by the chat ───────────────────────
+function CitationText({ content, citations }: { content: string; citations: Citation[] }) {
+  const [activeNum, setActiveNum] = useState<number | null>(null);
+  const [tooltipPos, setTooltipPos] = useState<{ top: number; left: number } | null>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+
+  const blocks = tokeniseBlocks(content);
+
+  useEffect(() => {
+    if (activeNum === null) return;
+    const handler = (e: MouseEvent) => {
+      if (tooltipRef.current?.contains(e.target as Node)) return;
+      setActiveNum(null);
+      setTooltipPos(null);
+    };
+    const id = setTimeout(() => document.addEventListener("click", handler), 0);
+    return () => { clearTimeout(id); document.removeEventListener("click", handler); };
+  }, [activeNum]);
+
+  const handleCite = (num: number, e: React.MouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    if (activeNum === num) { setActiveNum(null); setTooltipPos(null); return; }
+    const rect = e.currentTarget.getBoundingClientRect();
+    const TW = 300;
+    let left = rect.left + rect.width / 2 - TW / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - TW - 8));
+    setActiveNum(num);
+    setTooltipPos({ top: rect.top - 8, left });
+  };
+
+  const activeCit = activeNum !== null ? citations[activeNum - 1] ?? null : null;
+
+  return (
+    <>
+      <RenderBlocks
+        blocks={blocks}
+        citations={citations}
+        onCite={handleCite}
+        activeIdx={activeNum}
+      />
+
+      {/* Fixed citation tooltip */}
+      {activeNum !== null && activeCit && tooltipPos && (
         <div
           ref={tooltipRef}
           style={{
@@ -122,16 +342,19 @@ function CitationText({ content, citations }: { content: string; citations: Cita
             top: tooltipPos.top,
             left: tooltipPos.left,
             transform: "translateY(-100%)",
-            width: 288,
+            width: 300,
             zIndex: 9999,
           }}
-          className="rounded-xl border border-primary/30 bg-[#0e1120] shadow-2xl p-3 flex flex-col gap-1.5 text-left"
+          className="rounded-2xl border border-primary/30 bg-[#0e1120]/95 shadow-2xl p-4 flex flex-col gap-2 text-left backdrop-blur-md"
         >
-          <span className="text-[11px] font-semibold text-primary truncate block">{activeCit.file_name}</span>
-          <span className="text-[11px] text-muted-foreground leading-relaxed line-clamp-5 block">{activeCit.text}</span>
+          <div className="flex items-center gap-2">
+            <span className="w-5 h-5 rounded-full bg-primary/20 border border-primary/40 text-primary text-[10px] font-bold flex items-center justify-center flex-shrink-0">{activeNum}</span>
+            <span className="text-[12px] font-semibold text-foreground truncate">{activeCit.file_name}</span>
+          </div>
+          <p className="text-[11px] text-muted-foreground leading-relaxed line-clamp-5">{activeCit.text}</p>
           <button
-            onClick={() => { setActiveIdx(null); setTooltipPos(null); }}
-            className="self-end text-[10px] text-muted-foreground hover:text-foreground mt-1"
+            onClick={() => { setActiveNum(null); setTooltipPos(null); }}
+            className="self-end text-[10px] text-muted-foreground hover:text-foreground mt-1 transition-colors"
           >
             Close
           </button>
@@ -461,7 +684,136 @@ function WorkspaceContent() {
     ]);
   };
 
+  const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const activeNotebook = notebooks.find(n => n.id === selectedNotebookId);
+
+  const exportMenuRef = useRef<HTMLDivElement>(null);
+
+  // Close export menu on outside click
+  useEffect(() => {
+    if (!isExportMenuOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node)) {
+        setIsExportMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [isExportMenuOpen]);
+
+  // Strip markdown to plain text for export
+  const stripMarkdown = (md: string) => md
+    .replace(/#{1,6}\s+/g, "")
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/\*(.+?)\*/g, "$1")
+    .replace(/`{1,3}[^`]*`{1,3}/g, "")
+    .replace(/\[\d+\]/g, "")
+    .replace(/^[-*+]\s+/gm, "\u2022 ")
+    .replace(/^\d+\.\s+/gm, "")
+    .trim();
+
+  const exportAsPDF = useCallback(async () => {
+    if (messages.length <= 1) return;
+    setIsExporting(true);
+    setIsExportMenuOpen(false);
+    try {
+      const notebookTitle = activeNotebook?.title || "OpenNotebook Export";
+      const exportDate = new Date().toLocaleDateString("en-IN", { year: "numeric", month: "long", day: "numeric" });
+
+      // Build HTML for PDF
+      const chatHtml = messages.map((msg) => {
+        const isBot = msg.role === "assistant";
+        const text = stripMarkdown(msg.content)
+          .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br/>");
+        return `
+          <div style="margin-bottom:20px;">
+            <div style="font-size:11px;font-weight:600;color:${isBot ? "#6366f1" : "#888"};margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em;">
+              ${isBot ? "OpenNotebook AI" : "You"}
+            </div>
+            <div style="background:${isBot ? "#f0f0ff" : "#f9f9f9"};border-radius:8px;padding:14px 16px;font-size:13px;line-height:1.7;color:#1a1a2e;border-left:3px solid ${isBot ? "#6366f1" : "#ddd"};">${text}</div>
+          </div>`;
+      }).join("");
+
+      const html = `<!DOCTYPE html><html><head><meta charset="utf-8">
+        <title>${notebookTitle} — Chat Export</title>
+        <style>
+          body{font-family:Arial,sans-serif;max-width:800px;margin:40px auto;padding:0 24px;color:#1a1a2e;}
+          h1{font-size:22px;font-weight:700;color:#1a1a2e;margin-bottom:4px;}
+          .meta{font-size:12px;color:#888;margin-bottom:32px;}
+          hr{border:none;border-top:1px solid #e5e5e5;margin:24px 0;}
+        </style>
+      </head><body>
+        <h1>${notebookTitle} — Chat Export</h1>
+        <div class="meta">Exported from OpenNotebook · ${exportDate}</div>
+        <hr/>${chatHtml}
+      </body></html>`;
+
+      const blob = new Blob([html], { type: "text/html" });
+      const url = URL.createObjectURL(blob);
+      const win = window.open(url, "_blank");
+      if (win) {
+        win.onload = () => {
+          win.print();
+          setTimeout(() => URL.revokeObjectURL(url), 60000);
+        };
+      }
+    } finally {
+      setIsExporting(false);
+    }
+  }, [messages, activeNotebook]);
+
+  const exportAsTXT = useCallback(() => {
+    if (messages.length <= 1) return;
+    setIsExportMenuOpen(false);
+    const notebookTitle = activeNotebook?.title || "OpenNotebook Export";
+    const exportDate = new Date().toLocaleDateString("en-IN");
+    const lines: string[] = [
+      `${notebookTitle} — Chat Export`,
+      `Exported: ${exportDate}`,
+      `${"=".repeat(60)}`,
+      "",
+    ];
+    messages.forEach((msg) => {
+      lines.push(msg.role === "assistant" ? "[OpenNotebook AI]" : "[You]");
+      lines.push(stripMarkdown(msg.content));
+      lines.push("");
+    });
+    const blob = new Blob([lines.join("\n")], { type: "text/plain" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${notebookTitle.replace(/\s+/g, "_")}_export.txt`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, [messages, activeNotebook]);
+
+  const exportAsMarkdown = useCallback(() => {
+    if (messages.length <= 1) return;
+    setIsExportMenuOpen(false);
+    const notebookTitle = activeNotebook?.title || "OpenNotebook Export";
+    const exportDate = new Date().toLocaleDateString("en-IN");
+    const lines: string[] = [
+      `# ${notebookTitle} — Chat Export`,
+      `> Exported from OpenNotebook · ${exportDate}`,
+      "",
+      "---",
+      "",
+    ];
+    messages.forEach((msg) => {
+      lines.push(msg.role === "assistant" ? "### 🤖 OpenNotebook AI" : "### 👤 You");
+      lines.push("");
+      lines.push(msg.content);
+      lines.push("");
+      lines.push("---");
+      lines.push("");
+    });
+    const blob = new Blob([lines.join("\n")], { type: "text/markdown" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${notebookTitle.replace(/\s+/g, "_")}_export.md`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, [messages, activeNotebook]);
 
   return (
     <div className="flex h-[calc(100vh-64px)] overflow-hidden w-full bg-background relative selection:bg-primary/30 selection:text-primary">
@@ -769,6 +1121,58 @@ function WorkspaceContent() {
             )}
           </div>
           <div className="pointer-events-auto flex gap-2">
+            {/* Export Menu */}
+            <div className="relative" ref={exportMenuRef}>
+              <AnimatedButton
+                variant="outline"
+                size="sm"
+                className="h-8 bg-surface backdrop-blur-md"
+                onClick={() => setIsExportMenuOpen(prev => !prev)}
+                disabled={messages.length <= 1 || isExporting}
+                title="Export chat"
+              >
+                {isExporting ? (
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                ) : (
+                  <FileDown className="w-4 h-4 mr-2" />
+                )}
+                Export
+              </AnimatedButton>
+
+              <AnimatePresence>
+                {isExportMenuOpen && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -6, scale: 0.96 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: -6, scale: 0.96 }}
+                    transition={{ duration: 0.12 }}
+                    className="absolute right-0 top-10 z-50 w-44 bg-surface border border-white/10 rounded-xl shadow-2xl overflow-hidden"
+                  >
+                    <button
+                      onClick={exportAsPDF}
+                      className="w-full flex items-center gap-3 px-4 py-3 text-sm text-foreground hover:bg-white/5 transition-colors text-left"
+                    >
+                      <FileText className="w-4 h-4 text-red-400" />
+                      Export as PDF
+                    </button>
+                    <button
+                      onClick={exportAsMarkdown}
+                      className="w-full flex items-center gap-3 px-4 py-3 text-sm text-foreground hover:bg-white/5 transition-colors text-left border-t border-white/5"
+                    >
+                      <FileDown className="w-4 h-4 text-blue-400" />
+                      Export as .md
+                    </button>
+                    <button
+                      onClick={exportAsTXT}
+                      className="w-full flex items-center gap-3 px-4 py-3 text-sm text-foreground hover:bg-white/5 transition-colors text-left border-t border-white/5"
+                    >
+                      <Download className="w-4 h-4 text-green-400" />
+                      Export as .txt
+                    </button>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
             <AnimatedButton 
               variant="outline" 
               size="sm" 

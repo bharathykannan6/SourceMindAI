@@ -118,6 +118,23 @@ async def chat_with_notebook(
         db, notebook_id_str, user_id_str, conversation_id, "user", request.message
     )
 
+    # Build Groq key pool early — needed by query classifier before the main LLM call
+    groq_keys = [
+        k for k in [
+            settings.GROQ_API_KEY,
+            settings.GROQ_API_KEY_2,
+            settings.GROQ_API_KEY_3,
+            settings.GROQ_API_KEY_4,
+            settings.GROQ_API_KEY_5,
+        ] if k and k.strip()
+    ]
+    GROQ_MODEL_CASCADE = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "qwen/qwen3-32b",
+    ]
+    groq_last_error = ""
+
     # 2. Embed the user's message
     try:
         query_vector = embed_model.encode(request.message, convert_to_numpy=True).tolist()
@@ -200,24 +217,72 @@ async def chat_with_notebook(
                     bm25_scores[chunk_idx] = bm25_scores.get(chunk_idx, 0.0) + term_score
         sorted_bm25 = sorted(bm25_scores.items(), key=lambda x: x[1], reverse=True)
 
-    # 6. Detect query type
+    # 6. Detect query type — LLM classification replaces fragile keyword matching.
+    # A tiny llama-3.1-8b-instant call (~50 tokens) correctly handles phrasing
+    # that keyword lists miss: "give me a rundown", "break it down", "elaborate", etc.
+    # Falls back to keyword matching if the classification call fails.
     query_lower = request.message.lower()
+
+    # TOC detection stays keyword-based — it's a structural query with clear signals
     is_toc_query = any(term in query_lower for term in [
         "table of content", "table of contents", "toc", "index of", "chapters", "list the contents"
     ])
-    is_broad_query = any(term in query_lower for term in [
-        "summarize", "summary", "overview", "explain", "describe", "tell me about",
-        "what is", "what are", "journey", "history", "all", "entire", "whole",
-        "everything", "comprehensive", "detailed", "full",
-        "about", "topics", "themes", "issues", "problems", "common", "main",
-        "key", "important", "agents", "users", "conversations", "discuss",
-        "cover", "contains", "file", "document", "report"
-    ])
+
+    # ── LLM query classification ──────────────────────────────────────────────
+    is_broad_query = False  # default; set by classifier below
+    _classification_done = False
+
+    if not is_toc_query and groq_keys:
+        _classify_prompt = (
+            "Classify the following user query into exactly one category.\n"
+            "Reply with ONLY the single letter — no explanation, no punctuation, nothing else.\n\n"
+            "Categories:\n"
+            "B = broad/overview query (summary, overview, explain all, what is this about, "
+            "give a rundown, break it down, elaborate on, what does this cover, "
+            "topics, themes, main ideas, comprehensive view, tell me about, journey, history)\n"
+            "S = specific query (a precise question, definition lookup, who is X, "
+            "comparison, list of items, a single fact, step-by-step instruction)\n\n"
+            f"Query: {request.message}\n\n"
+            "Reply with B or S only."
+        )
+        for _groq_key in groq_keys:
+            try:
+                _clf_client = Groq(api_key=_groq_key)
+                _clf_resp = _clf_client.chat.completions.create(
+                    messages=[{"role": "user", "content": _classify_prompt}],
+                    model="llama-3.1-8b-instant",   # fastest/cheapest — classification only
+                    temperature=0.0,
+                    max_tokens=2,
+                )
+                _label = _clf_resp.choices[0].message.content.strip().upper()
+                if _label.startswith("B"):
+                    is_broad_query = True
+                    print(f"[QueryClassifier] → BROAD (LLM classified)")
+                else:
+                    is_broad_query = False
+                    print(f"[QueryClassifier] → SPECIFIC (LLM classified)")
+                _classification_done = True
+                break
+            except Exception as _clf_err:
+                print(f"[QueryClassifier] LLM call failed: {_clf_err} — will use keyword fallback")
+                continue
+
+    # Keyword fallback if LLM classification failed or no keys available
+    if not _classification_done:
+        is_broad_query = any(term in query_lower for term in [
+            "summarize", "summary", "overview", "explain", "describe", "tell me about",
+            "what is", "what are", "journey", "history", "all", "entire", "whole",
+            "everything", "comprehensive", "detailed", "full",
+            "about", "topics", "themes", "issues", "problems", "common", "main",
+            "key", "important", "agents", "users", "conversations", "discuss",
+            "cover", "contains", "file", "document", "report"
+        ])
+        print(f"[QueryClassifier] → {'BROAD' if is_broad_query else 'SPECIFIC'} (keyword fallback)")
 
     dense_limit = 60 if (is_broad_query or is_toc_query) else 20
     max_context_chunks = 60 if is_toc_query else (50 if is_broad_query else 20)
 
-    # 7. Dense semantic search
+    # 7. Dense semantic search (original query vector)
     dense_results = []
     try:
         dense_results = qdrant_client.search(
@@ -229,22 +294,121 @@ async def chat_with_notebook(
     except Exception as e:
         print(f"Qdrant dense search error: {e}")
 
-    # 8. RRF fusion
+    # 7b. HyDE — Hypothetical Document Embedding
+    #
+    # HALLUCINATION GUARD DESIGN (addresses the core HyDE risk):
+    #
+    # Problem: if the LLM generates a wild hypothetical, its vector points
+    # in the wrong direction and pollutes retrieval.
+    #
+    # Four-layer defence implemented here:
+    #   1. temperature=0.0  — deterministic, no creative drift
+    #   2. max_tokens=120   — forces a short, dense factual phrase; no room to hallucinate
+    #   3. Strict prompt     — instructs the model to use ONLY terms likely in the document;
+    #                          explicitly forbids inventing facts
+    #   4. Cosine similarity gate — the HyDE vector is only used if it is
+    #                          sufficiently similar to the original query vector
+    #                          (dot product >= 0.25). If the LLM drifted far from
+    #                          the query topic, the cosine similarity drops below
+    #                          the threshold and HyDE is silently skipped.
+    #                          Original query vector always runs regardless.
+    #
+    # HyDE is skipped entirely for broad/summary queries — those go to
+    # Map-Reduce which reads all chunks directly, so HyDE adds no value there.
+
+    hyde_dense_results = []
+    hyde_vector = None
+
+    if not is_broad_query and not is_toc_query and groq_keys and doc_count > 0:
+        _hyde_prompt = (
+            "Write a single short paragraph (3-5 sentences) that directly answers "
+            "the following question, as if it were an excerpt from a relevant document. "
+            "Use only terminology and concepts that would realistically appear in a "
+            "document on this topic. Do NOT invent specific names, numbers, dates, or "
+            "facts — use realistic placeholder language instead. "
+            "Output only the paragraph, nothing else.\n\n"
+            f"Question: {request.message}"
+        )
+        for _groq_key in groq_keys:
+            try:
+                _hyde_client = Groq(api_key=_groq_key)
+                _hyde_resp = _hyde_client.chat.completions.create(
+                    messages=[{"role": "user", "content": _hyde_prompt}],
+                    model="llama-3.1-8b-instant",  # fast + cheap — generation only
+                    temperature=0.0,               # Guard 1: fully deterministic
+                    max_tokens=120,                # Guard 2: no room to hallucinate
+                )
+                _hypo_text = _hyde_resp.choices[0].message.content.strip()
+
+                if _hypo_text:
+                    _hypo_vector = embed_model.encode(
+                        _hypo_text, convert_to_numpy=True
+                    ).tolist()
+
+                    # Guard 4: cosine similarity gate
+                    # Both vectors are L2-normalised by bge-base, so dot product == cosine sim
+                    import numpy as np
+                    _q = np.array(query_vector)
+                    _h = np.array(_hypo_vector)
+                    _sim = float(np.dot(_q, _h) / (np.linalg.norm(_q) * np.linalg.norm(_h) + 1e-9))
+
+                    if _sim >= 0.25:
+                        hyde_vector = _hypo_vector
+                        hyde_dense_results = qdrant_client.search(
+                            collection_name=VECTOR_COLLECTION,
+                            query_vector=hyde_vector,
+                            query_filter=doc_filter,
+                            limit=dense_limit
+                        )
+                        print(f"[HyDE] Generated hypothetical (sim={_sim:.3f}) — "
+                              f"{len(hyde_dense_results)} results")
+                    else:
+                        print(f"[HyDE] Hypothetical rejected: cosine sim {_sim:.3f} < 0.25 "
+                              f"— skipping to avoid polluting retrieval")
+                break
+            except Exception as _hyde_err:
+                print(f"[HyDE] Failed: {_hyde_err} — skipping")
+                break
+
+    # 8. RRF fusion — up to three ranked lists:
+    #   - dense_results      : original query vector (always present)
+    #   - hyde_dense_results : HyDE hypothetical vector (only if sim gate passed)
+    #   - sorted_bm25        : BM25 keyword scores
+    #
+    # RRF weight for HyDE is 0.7x vs original dense — it is a supporting signal,
+    # not an equal vote. This limits the blast radius if HyDE drifts slightly.
+    HYDE_RRF_WEIGHT = 0.7  # original dense = 1.0, HyDE = 0.7, BM25 = 1.0
+
     rrf_scores = {}
     point_map = {}
+
+    # Original dense results — full weight
     for rank, hit in enumerate(dense_results):
         p_id = str(hit.id)
         point_map[p_id] = hit
         rrf_scores[p_id] = rrf_scores.get(p_id, 0.0) + 1.0 / (60.0 + (rank + 1))
+
+    # HyDE dense results — reduced weight (0.7x)
+    for rank, hit in enumerate(hyde_dense_results):
+        p_id = str(hit.id)
+        if p_id not in point_map:
+            point_map[p_id] = hit
+        rrf_scores[p_id] = rrf_scores.get(p_id, 0.0) + HYDE_RRF_WEIGHT / (60.0 + (rank + 1))
+
+    # BM25 results — full weight
     for rank, (chunk_idx, score) in enumerate(sorted_bm25[:60]):
         chunk = chunks_res[chunk_idx]
         p_id = str(chunk.id)
         point_map[p_id] = chunk
         rrf_scores[p_id] = rrf_scores.get(p_id, 0.0) + 1.0 / (60.0 + (rank + 1))
+
     sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
-    # 9. Reranker
-    rerank_candidates = sorted_rrf[:30]
+    # 9. Reranker — top 50 candidates (was 30).
+    # Broader coverage ensures relevant chunks ranked 31-50 in RRF
+    # (due to BM25/dense disagreement) are properly evaluated.
+    RERANK_TOP_K = 50
+    rerank_candidates = sorted_rrf[:RERANK_TOP_K]
     if reranker and rerank_candidates:
         try:
             candidate_texts = [
@@ -257,9 +421,9 @@ async def chat_with_notebook(
                 zip([p_id for p_id, _ in rerank_candidates], rerank_scores),
                 key=lambda x: x[1], reverse=True
             )
-            remaining = sorted_rrf[30:]
+            remaining = sorted_rrf[RERANK_TOP_K:]
             sorted_rrf = [(p_id, float(score)) for p_id, score in reranked] + remaining
-            print(f"[Reranker] Reranked {len(rerank_candidates)} candidates")
+            print(f"[Reranker] Reranked {len(rerank_candidates)} candidates (top {RERANK_TOP_K})")
         except Exception as rerank_err:
             print(f"[Reranker] Error: {rerank_err} — skipping reranking")
 
@@ -373,23 +537,6 @@ async def chat_with_notebook(
             score=float(score)
         ))
 
-    # Build Groq key pool and model cascade early — used in both summary and RAG paths
-    groq_keys = [
-        k for k in [
-            settings.GROQ_API_KEY,
-            settings.GROQ_API_KEY_2,
-            settings.GROQ_API_KEY_3,
-            settings.GROQ_API_KEY_4,
-            settings.GROQ_API_KEY_5,
-        ] if k and k.strip()
-    ]
-    GROQ_MODEL_CASCADE = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "qwen/qwen3-32b",
-    ]
-    groq_last_error = ""
-
     # ── SUMMARY PATH: Map-Reduce over ALL chunks ─────────────────────────────
     if is_broad_query and not is_toc_query:
         print(f"[Chat] Summary query detected — using Map-Reduce over {len(chunks_res)} chunks")
@@ -429,10 +576,13 @@ async def chat_with_notebook(
         partial_summaries = []
 
         map_system = (
-            "You are a document analysis assistant. "
-            "Read the following excerpt and extract key information: "
-            "main topics, important facts, key figures, conclusions, notable details. "
-            "Be concise but thorough. Output only extracted information, no preamble."
+            "You are an elite document intelligence engine operating inside OpenNotebook — "
+            "an enterprise-grade AI research platform. "
+            "Your task is to extract high-signal information from the provided document excerpt. "
+            "Identify and capture: core topics, critical facts, key figures, quantitative data, "
+            "conclusions, decisions, and any notable insights. "
+            "Be thorough yet precise. Eliminate noise. Output structured extracted information only — "
+            "no preamble, no commentary, no filler."
         )
 
         for doc_id, indexed_chunks in doc_chunks_map.items():
@@ -446,8 +596,37 @@ async def chat_with_notebook(
             if total_batches <= MAX_MAP_BATCHES:
                 sampled_batches = list(enumerate(all_batches))
             else:
-                step = total_batches / MAX_MAP_BATCHES
-                sampled_indices = [int(i * step) for i in range(MAX_MAP_BATCHES)]
+                # Smart sampling: always include start + end + evenly spaced middle.
+                # Previous uniform sampling could skip the introduction and conclusions
+                # entirely if they happened to fall between sampled indices.
+                # Conclusions and key findings almost always appear at the end;
+                # context and background at the start — both are critical for quality.
+                HEAD = min(3, MAX_MAP_BATCHES // 3)          # first N batches
+                TAIL = min(3, MAX_MAP_BATCHES // 3)          # last N batches
+                MIDDLE_BUDGET = MAX_MAP_BATCHES - HEAD - TAIL  # remaining slots
+
+                head_indices = list(range(HEAD))
+                tail_indices = list(range(total_batches - TAIL, total_batches))
+
+                # Middle: evenly spaced from the region between head and tail
+                middle_start = HEAD
+                middle_end = total_batches - TAIL
+                if MIDDLE_BUDGET > 0 and middle_end > middle_start:
+                    step = (middle_end - middle_start) / MIDDLE_BUDGET
+                    middle_indices = [
+                        int(middle_start + i * step) for i in range(MIDDLE_BUDGET)
+                    ]
+                else:
+                    middle_indices = []
+
+                # Deduplicate and preserve document order
+                seen_idx: set = set()
+                sampled_indices = []
+                for idx in head_indices + middle_indices + tail_indices:
+                    if idx not in seen_idx and 0 <= idx < total_batches:
+                        seen_idx.add(idx)
+                        sampled_indices.append(idx)
+                sampled_indices.sort()
                 sampled_batches = [(i, all_batches[i]) for i in sampled_indices]
 
             print(f"[Chat] Map phase: '{file_name}' — {len(indexed_chunks)} chunks, {total_chars} chars, {len(sampled_batches)}/{total_batches} batches")
@@ -500,16 +679,41 @@ async def chat_with_notebook(
                 combined = combined[:MAX_REDUCE_CHARS] + "\n\n[Partial summaries trimmed]"
 
             reduce_system = (
-                "You are an expert research assistant. "
-                "You have been given partial summaries of one or more documents. "
-                "Synthesize them into a single, comprehensive, well-structured final summary.\n\n"
-                "CITATION RULE — MANDATORY: Every sentence or fact you write MUST end with an inline "
-                "source number like [1], [2], [3] referring to the source document. "
-                "The source numbers correspond to the order the documents were provided. "
-                "Do NOT write any sentence without a citation. "
-                "Do NOT add a references section at the end — only inline [N] markers.\n\n"
-                "Use markdown formatting. Be specific — use actual names, numbers, and facts from the summaries. "
-                "Do not hallucinate. If information is not in the summaries, do not include it."
+                "You are OpenNotebook's senior research synthesis engine — an authoritative, "
+                "enterprise-grade AI that produces citation-grounded, content-driven summaries.\n\n"
+
+                "## YOUR TASK\n"
+                "You have been given extracted intelligence from one or more source documents. "
+                "Read the content carefully. Identify what kind of document this is "
+                "(e.g. academic paper, business report, legal document, transcript, technical manual, "
+                "news article, interview, dataset, etc.) and what topics and themes it actually contains. "
+                "Then write a comprehensive summary that reflects the ACTUAL structure and content "
+                "of the source material — not a generic template.\n\n"
+
+                "## STRUCTURING RULES\n"
+                "- Do NOT use a fixed template or pre-defined section names.\n"
+                "- Let the content determine the sections. "
+                "If the document is about a product launch, your sections should reflect that. "
+                "If it is a legal case, structure around parties, arguments, and rulings. "
+                "If it is a research paper, follow its natural flow: problem, methodology, results, conclusions. "
+                "If it is a transcript, surface speakers, key discussion points, and outcomes.\n"
+                "- Use Markdown headers (##) for each major section you derive from the content.\n"
+                "- Use bullet points within sections when listing multiple items or findings.\n"
+                "- Be specific: use actual names, figures, dates, decisions, and technical terms "
+                "exactly as they appear in the source.\n\n"
+
+                "## CITATION MANDATE (NON-NEGOTIABLE)\n"
+                "Every sentence or factual claim MUST end with an inline source marker [1], [2], etc. "
+                "The numbers correspond to the order documents were provided. "
+                "No sentence may exist without a citation. "
+                "Do NOT append a references section — only inline [N] markers within the prose.\n\n"
+
+                "## QUALITY STANDARDS\n"
+                "- Never hallucinate or infer beyond what the source material explicitly states.\n"
+                "- If information on a topic is absent, state: "
+                "'The source documents do not address [topic].' — do not fill gaps with assumptions.\n"
+                "- Maintain an authoritative, precise, and information-dense tone throughout.\n"
+                "- Surface the most important and actionable content first within each section."
             )
             reduce_user = (
                 f"Partial summaries from notebook '{notebook_name}':\n\n{combined}\n\n"
@@ -594,52 +798,67 @@ async def chat_with_notebook(
         memory_block += "\n"
 
     system_prompt = (
-        "You are a helpful AI research assistant inside OpenNotebookLM.\n"
-        f"The user is asking questions about documents in a notebook named '{notebook_name}'.\n\n"
-        "INSTRUCTIONS:\n"
-        "Answer the user's question directly using ONLY the Source Context provided. "
-        "Never use outside knowledge.\n\n"
-        "FORMAT based on what the user asked:\n\n"
-        "1. LIST REQUEST (e.g. 'list the questions', 'give me the topics', 'what are the steps'):\n"
-        "   Output a clean numbered list. No intro paragraph. No section headers. No commentary.\n"
-        "   Example:\n"
-        "   1. Define data communication\n"
-        "   2. Compare MAC and IP address\n"
-        "   3. Explain error correction\n\n"
-        "2. PERSON / IDENTITY (e.g. 'who is X', 'tell me about X'):\n"
-        "   If found in context: one short paragraph with name, role, and details.\n"
-        "   If NOT found: reply ONLY with 'There is no mention of [X] in the uploaded documents.' Then stop.\n"
-        "   Important: search carefully including partial name matches before saying not found.\n\n"
-        "3. EXPLAIN / DEFINE (e.g. 'what is X', 'explain X', 'how does X work'):\n"
-        "   Give a clear direct explanation. Use bullets if listing multiple aspects.\n\n"
-        "4. SUMMARY / OVERVIEW (e.g. 'summarize', 'what is this about', 'overview'):\n"
-        "   Write a structured summary.\n"
-        "   For chat/support logs also add: ## People Involved, ## Common Issues\n"
-        "   Use bullet points. Be specific with names, dates, numbers from context.\n\n"
-        "5. COMPARISON (e.g. 'compare X and Y', 'difference between X and Y'):\n"
-        "   Use clear bullet points per item or side-by-side structure.\n\n"
-        "6. ANY OTHER QUESTION:\n"
-        "   Answer directly and concisely using only the Source Context.\n"
-        "   If not found: 'The uploaded documents do not contain information about [topic].'\n\n"
-        "ALWAYS:\n"
-        "- Never add sections or content the user did not ask for.\n"
-        "- Never pad the response with unrelated content.\n"
-        "- CITATION RULE — MANDATORY: After EVERY sentence place the source number inline like [1] or [2].\n"
-        "  The numbers match Source [1], Source [2] etc. from the context provided above.\n"
-        "  Never write a sentence without a citation marker.\n"
-        "  Never group all citations at the end — place [N] right after each sentence.\n"
-        "  Example: The system supports up to 5 users [1]. New logins are blocked when exceeded [2].\n"
-        "- Use Markdown (bold, bullets, headers) only when it improves clarity.\n"
-        "- Keep the response proportional to what was asked.\n\n"
-        "Behavior Rules:\n"
-        "- Maintain clarity and readability.\n"
-        "- Prefer concise but high-information responses.\n"
-        "- Avoid hallucinating missing information.\n"
-        "- Clearly state when information is not available in the document.\n"
-        "- Preserve factual accuracy.\n"
-        "- If the document is technical, explain difficult concepts simply while preserving correctness.\n"
-        "- If the document is very large, prioritize the most important and actionable information.\n"
-        "- Always maintain professional formatting suitable for research assistants.\n"
+        "You are OpenNotebook's premium AI research assistant — an authoritative, enterprise-grade "
+        "intelligence engine designed to deliver structured, citation-grounded, and information-dense "
+        f"responses. The user is working inside a notebook named '{notebook_name}'.\n\n"
+
+        "## CORE MANDATE\n"
+        "Answer exclusively from the Source Context provided. Never introduce outside knowledge, "
+        "assumptions, or hallucinated content. Every factual claim must be traceable to a source.\n\n"
+
+        "## RESPONSE FORMAT — MATCH THE QUERY TYPE\n\n"
+
+        "**1. LIST / ENUMERATION** (e.g. 'list the questions', 'what are the steps', 'give me the topics')\n"
+        "   → Output a clean, numbered list. No intro paragraph. No headers. No commentary.\n"
+        "   Example output:\n"
+        "   1. Define data communication [1]\n"
+        "   2. Compare MAC and IP address [2]\n"
+        "   3. Explain error correction [1]\n\n"
+
+        "**2. PERSON / ENTITY LOOKUP** (e.g. 'who is X', 'tell me about X')\n"
+        "   → If found: one precise paragraph — name, role, context, key details. Cite every sentence.\n"
+        "   → If not found after careful search (including partial name matches):\n"
+        "     Reply ONLY: 'There is no mention of [X] in the uploaded documents.' Then stop.\n\n"
+
+        "**3. DEFINITION / EXPLANATION** (e.g. 'what is X', 'explain X', 'how does X work')\n"
+        "   → Lead with a crisp one-sentence definition [citation].\n"
+        "   → Follow with bullet points if multiple aspects or mechanisms are involved.\n"
+        "   → Use bold for key terms. Keep explanation precise and technically accurate.\n\n"
+
+        "**4. SUMMARY / OVERVIEW** (e.g. 'summarize', 'what is this about', 'give me an overview')\n"
+        "   → Structure:\n"
+        "     ## Executive Summary\n"
+        "     ## Key Topics & Themes\n"
+        "     ## Notable Details (names, dates, figures, decisions)\n"
+        "     ## People Involved (if applicable)\n"
+        "     ## Common Issues / Outcomes (if applicable)\n"
+        "   → Use bullet points within each section. Be specific — no vague generalities.\n\n"
+
+        "**5. COMPARISON** (e.g. 'compare X and Y', 'difference between X and Y')\n"
+        "   → Use a structured side-by-side bullet format or clearly separated sections per item.\n"
+        "   → Bold the differentiating attributes. Cite each point.\n\n"
+
+        "**6. ALL OTHER QUERIES**\n"
+        "   → Answer directly, concisely, and with high information density.\n"
+        "   → If the topic is not in the source context:\n"
+        "     'The uploaded documents do not contain information about [topic].'\n\n"
+
+        "## CITATION MANDATE (NON-NEGOTIABLE)\n"
+        "- Place an inline citation marker [N] after EVERY sentence that states a fact.\n"
+        "- [N] corresponds to Source [1], Source [2], etc. from the context provided.\n"
+        "- No sentence may exist without a citation marker.\n"
+        "- Do NOT group citations at the end — embed [N] directly after each sentence.\n"
+        "  Correct: 'The system supports 5 concurrent users [1]. Login is blocked beyond this limit [2].'\n"
+        "  Incorrect: 'The system supports 5 users and blocks logins beyond that limit. [1][2]'\n\n"
+
+        "## PROFESSIONAL STANDARDS\n"
+        "- Tone: authoritative, precise, and information-dense — never casual, generic, or verbose\n"
+        "- Formatting: use Markdown (bold, headers, bullets) only when it enhances clarity\n"
+        "- Scale: keep the response proportional to the complexity of the query\n"
+        "- Accuracy: preserve exact names, figures, dates, and technical terms from the source material\n"
+        "- Gaps: if source material is incomplete, state it explicitly rather than inferring\n"
+        "- Concepts: if the document is technical, explain precisely while preserving correctness\n"
+        "- Priority: surface the most important and actionable information first\n"
     )
 
     user_content = (
@@ -731,9 +950,13 @@ async def chat_with_notebook(
                     ollama_context += f"[{i+1}] {c.file_name}:\n{c.text[:300]}\n\n"
 
                 ollama_system = (
-                    "You are a helpful assistant. Answer the user's question using ONLY the source context. "
-                    "Be concise and direct. Format as a numbered list if the user asks for a list. "
-                    "If the answer is not in the context, say so."
+                    "You are OpenNotebook's AI research assistant — authoritative, precise, and citation-grounded. "
+                    "Answer the user's question using ONLY the source context provided. "
+                    "Place an inline citation [N] after every factual sentence. "
+                    "If the answer is not in the context, state: "
+                    "'The uploaded documents do not contain information about [topic].' "
+                    "Use structured formatting (numbered lists, bold, bullets) when it aids clarity. "
+                    "Never hallucinate. Never use outside knowledge."
                 )
                 ollama_user_content = (
                     f"Source Context:\n{ollama_context or 'No sources available.'}\n"
